@@ -1,14 +1,19 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use tokio::net::UdpSocket;
+use tokio::sync::Semaphore;
 
 use crate::handler;
 use crate::packet::{self, Packet};
 
+const MAX_CONCURRENT_TRANSFERS: usize = 64;
+
 pub struct Server {
     root: PathBuf,
     socket: UdpSocket,
+    transfer_semaphore: Arc<Semaphore>,
 }
 
 impl Server {
@@ -19,7 +24,11 @@ impl Server {
 
     async fn bind_addr(root: PathBuf, addr: SocketAddr) -> std::io::Result<Self> {
         let socket = UdpSocket::bind(addr).await?;
-        Ok(Server { root, socket })
+        Ok(Server {
+            root,
+            socket,
+            transfer_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_TRANSFERS)),
+        })
     }
 
     #[cfg(test)]
@@ -53,9 +62,23 @@ impl Server {
 
             match &packet {
                 Packet::Rrq { .. } | Packet::Wrq { .. } => {
+                    let semaphore = self.transfer_semaphore.clone();
+                    let permit = match semaphore.try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            eprintln!("too many concurrent transfers, rejecting {peer}");
+                            let err_pkt = Packet::Error {
+                                code: packet::ERR_NOT_DEFINED,
+                                message: "server busy".into(),
+                            };
+                            let _ = self.socket.send_to(&err_pkt.encode(), peer).await;
+                            continue;
+                        }
+                    };
                     let root = self.root.clone();
                     let pkt = packet.clone();
                     tokio::spawn(async move {
+                        let _permit = permit;
                         if let Err(e) = handle_request(root, peer, pkt).await {
                             eprintln!("transfer error for {peer}: {e}");
                         }
@@ -106,8 +129,10 @@ async fn handle_request(
         _ => return Ok(()),
     };
 
-    if let Err(err_pkt) = result {
-        let _ = transfer_socket.send(&err_pkt.encode()).await;
+    if let Err(err_pkt) = result
+        && let Err(e) = transfer_socket.send(&err_pkt.encode()).await
+    {
+        eprintln!("failed to send error to {peer}: {e}");
     }
 
     Ok(())

@@ -7,6 +7,71 @@ use tokio::net::UdpSocket;
 
 use crate::packet::{self, Packet, MAX_DATA_LEN};
 
+/// resolves the real filesystem path of an open file descriptor.
+#[cfg(unix)]
+fn fd_real_path(fd: std::os::unix::io::RawFd) -> std::io::Result<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link(format!("/proc/self/fd/{fd}"))
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        let mut buf = vec![0u8; libc::PATH_MAX as usize];
+        let ret = unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) };
+        if ret == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        Ok(PathBuf::from(std::ffi::OsString::from_vec(
+            buf[..len].to_vec(),
+        )))
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = fd;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "fd-to-path not supported on this platform",
+        ))
+    }
+}
+
+/// verifies that an opened file descriptor actually resides within the
+/// expected root directory. closes the TOCTOU gap between path resolution
+/// and file open by reading the real path from the fd.
+#[cfg(unix)]
+fn verify_fd_within_root(file: &File, root: &Path) -> Result<(), Packet> {
+    use std::os::unix::io::AsRawFd;
+
+    let canonical_root = root.canonicalize().map_err(|_| Packet::Error {
+        code: packet::ERR_NOT_DEFINED,
+        message: "server error".into(),
+    })?;
+
+    let real_path = match fd_real_path(file.as_raw_fd()) {
+        Ok(p) => p,
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => return Ok(()),
+        Err(_) => {
+            return Err(Packet::Error {
+                code: packet::ERR_NOT_DEFINED,
+                message: "server error".into(),
+            })
+        }
+    };
+
+    if !real_path.starts_with(&canonical_root) {
+        return Err(Packet::Error {
+            code: packet::ERR_ACCESS_VIOLATION,
+            message: "access violation".into(),
+        });
+    }
+
+    Ok(())
+}
+
 const MAX_RETRIES: u32 = 3;
 const RETRY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -140,6 +205,10 @@ pub async fn handle_rrq(
         }
     })?;
 
+    // verify the opened fd is actually within root (closes TOCTOU gap)
+    #[cfg(unix)]
+    verify_fd_within_root(&file, root)?;
+
     let mut block_num: u16 = 1;
     let mut buf = vec![0u8; MAX_DATA_LEN];
 
@@ -253,18 +322,22 @@ pub async fn handle_wrq(
             }
         })?;
 
+    // verify the created file is actually within root (closes TOCTOU gap).
+    // on failure, we intentionally do NOT remove by pathname — the path
+    // is untrustworthy at this point (symlink swap between verify and
+    // unlink would allow arbitrary file deletion). a leaked empty file
+    // is the lesser evil.
+    #[cfg(unix)]
+    if let Err(e) = verify_fd_within_root(&file, root) {
+        drop(file);
+        return Err(e);
+    }
+
     // send ACK 0 to accept the transfer
     let ack0 = Packet::Ack { block_num: 0 };
-    socket.send(&ack0.encode()).await.map_err(|_| {
-        // clean up file if we can't communicate with the client
-        let path_clone = path.clone();
-        tokio::spawn(async move {
-            let _ = tokio::fs::remove_file(&path_clone).await;
-        });
-        Packet::Error {
-            code: packet::ERR_NOT_DEFINED,
-            message: "failed to send initial ACK".into(),
-        }
+    socket.send(&ack0.encode()).await.map_err(|_| Packet::Error {
+        code: packet::ERR_NOT_DEFINED,
+        message: "failed to send initial ACK".into(),
     })?;
 
     let mut expected_block: u16 = 1;
@@ -274,8 +347,6 @@ pub async fn handle_wrq(
         let data = match wait_for_data(socket, expected_block).await {
             Ok(d) => d,
             Err(client_error) => {
-                // clean up partial file
-                let _ = tokio::fs::remove_file(&path).await;
                 if client_error {
                     // client sent ERROR - don't respond per RFC 1350 Section 5
                     return Ok(());
@@ -288,23 +359,18 @@ pub async fn handle_wrq(
         };
 
         // write data to file
-        file.write_all(&data).await.map_err(|_| {
-            // clean up partial file on write failure (best-effort, sync context)
-            let path_clone = path.clone();
-            tokio::spawn(async move {
-                let _ = tokio::fs::remove_file(&path_clone).await;
-            });
-            Packet::Error {
-                code: packet::ERR_DISK_FULL,
-                message: "disk write failed".into(),
-            }
+        file.write_all(&data).await.map_err(|_| Packet::Error {
+            code: packet::ERR_DISK_FULL,
+            message: "disk write failed".into(),
         })?;
 
         // send ACK for this block
         let ack = Packet::Ack {
             block_num: expected_block,
         };
-        let _ = socket.send(&ack.encode()).await;
+        if let Err(e) = socket.send(&ack.encode()).await {
+            eprintln!("failed to send ACK for block {expected_block}: {e}");
+        }
 
         // last block: data < 512 bytes signals end of transfer
         if data.len() < MAX_DATA_LEN {
@@ -312,7 +378,6 @@ pub async fn handle_wrq(
         }
 
         if expected_block == u16::MAX {
-            let _ = tokio::fs::remove_file(&path).await;
             return Err(Packet::Error {
                 code: packet::ERR_NOT_DEFINED,
                 message: "file too large for TFTP".into(),
@@ -321,53 +386,57 @@ pub async fn handle_wrq(
         expected_block += 1;
     }
 
-    file.flush().await.map_err(|_| {
-        let path_clone = path.clone();
-        tokio::spawn(async move {
-            let _ = tokio::fs::remove_file(&path_clone).await;
-        });
-        Packet::Error {
-            code: packet::ERR_DISK_FULL,
-            message: "disk write failed".into(),
-        }
+    file.flush().await.map_err(|_| Packet::Error {
+        code: packet::ERR_DISK_FULL,
+        message: "disk write failed".into(),
     })?;
 
     Ok(())
 }
 
 /// waits for a DATA packet with the expected block number, with retries and timeout.
+/// uses a total deadline so stale/wrong packets cannot extend the wait indefinitely.
 /// returns Ok(data) on success, Err(true) if client sent ERROR (fatal),
 /// Err(false) on timeout after retries.
 async fn wait_for_data(socket: &UdpSocket, expected_block: u16) -> Result<Vec<u8>, bool> {
-    let mut timeouts = 0u32;
+    let deadline = tokio::time::Instant::now() + RETRY_TIMEOUT * MAX_RETRIES;
+    let mut next_resend = tokio::time::Instant::now() + RETRY_TIMEOUT;
     loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(false);
+        }
+
+        let wait_until = next_resend.min(deadline);
+        let remaining = wait_until.saturating_duration_since(now);
+
         let mut recv_buf = [0u8; 4 + MAX_DATA_LEN];
-        let result = tokio::time::timeout(RETRY_TIMEOUT, socket.recv(&mut recv_buf)).await;
+        let result = tokio::time::timeout(remaining, socket.recv(&mut recv_buf)).await;
 
         match result {
             Ok(Ok(len)) => match Packet::decode(&recv_buf[..len]) {
                 Ok(Packet::Data { block_num, data }) if block_num == expected_block => {
                     return Ok(data);
                 }
+                Ok(Packet::Data { block_num, .. })
+                    if block_num == expected_block.wrapping_sub(1) =>
+                {
+                    // client retransmitted previous block (likely lost ACK) - re-ACK it
+                    let ack = Packet::Ack { block_num };
+                    let _ = socket.send(&ack.encode()).await;
+                }
                 Ok(Packet::Error { .. }) => return Err(true),
                 _ => {
-                    // wrong block or non-DATA packet - resend previous ACK
-                    let prev_ack = Packet::Ack {
-                        block_num: expected_block.wrapping_sub(1),
-                    };
-                    let _ = socket.send(&prev_ack.encode()).await;
+                    // other wrong block or non-DATA packet - ignored, deadline still applies
                 }
             },
             _ => {
                 // timeout or recv error - resend previous ACK to trigger retransmit
-                timeouts += 1;
-                if timeouts >= MAX_RETRIES {
-                    return Err(false);
-                }
                 let prev_ack = Packet::Ack {
                     block_num: expected_block.wrapping_sub(1),
                 };
                 let _ = socket.send(&prev_ack.encode()).await;
+                next_resend = tokio::time::Instant::now() + RETRY_TIMEOUT;
             }
         }
     }
@@ -851,7 +920,8 @@ mod tests {
         assert_eq!(code, packet::ERR_NOT_DEFINED);
         assert!(message.contains("timed out"));
 
-        // partial file should be cleaned up
-        assert!(!dir.path().join("timeout.txt").exists());
+        // partial file is intentionally NOT cleaned up by pathname to prevent
+        // symlink-swap attacks (see comment in handle_wrq verify_fd_within_root path)
+        assert!(dir.path().join("timeout.txt").exists());
     }
 }
