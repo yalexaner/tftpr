@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-#[command(name = "tftpr", about = "zero-config TFTP server")]
+#[command(name = "tftpr", version, about = "zero-config TFTP server")]
 pub struct Cli {
     /// directory to serve (defaults to current directory)
     #[arg(default_value = ".")]

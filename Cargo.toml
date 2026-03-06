@@ -2,6 +2,9 @@
 name = "tftpr"
 version = "0.1.0"
 edition = "2024"
+description = "a zero-config TFTP server"
+license = "MIT"
+repository = "https://github.com/yalexaner/tftpr"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -10,3 +13,8 @@ thiserror = "2"
 
 [dev-dependencies]
 tempfile = "3"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

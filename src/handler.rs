@@ -821,7 +821,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_write_path_file_exists() {
+    fn resolve_write_path_allows_existing_file() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("taken.txt"), b"data").unwrap();
         let result = resolve_path_for_write(dir.path(), "taken.txt");

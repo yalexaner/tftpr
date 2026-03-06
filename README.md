@@ -30,6 +30,7 @@ tftpr [OPTIONS] [DIRECTORY]
 ### Options
 
 - `-p, --port <PORT>` - port to listen on (default: 69)
+- `-V, --version` - print version
 - `-h, --help` - print help
 
 ### Examples
@@ -57,6 +58,25 @@ Upload a file:
 ```
 tftp localhost 6969 -c put newfile.txt
 ```
+
+## Releasing
+
+Releases are automated with [cargo-dist](https://opensource.axo.dev/cargo-dist/) and [cargo-release](https://github.com/crate-ci/cargo-release).
+
+To publish a new release:
+
+```
+cargo release patch   # or minor, major
+```
+
+This bumps the version in Cargo.toml, commits, tags, and pushes. The pushed tag triggers a GitHub Actions workflow that builds binaries for all supported platforms and creates a GitHub release.
+
+Supported platforms:
+- x86_64-unknown-linux-gnu
+- aarch64-unknown-linux-gnu
+- x86_64-apple-darwin
+- aarch64-apple-darwin
+- x86_64-pc-windows-msvc
 
 ## License
 
