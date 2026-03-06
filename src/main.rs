@@ -1,3 +1,61 @@
+mod packet;
+
+use std::path::PathBuf;
+
+use clap::Parser;
+
+#[derive(Parser, Debug)]
+#[command(name = "tftpr", about = "zero-config TFTP server")]
+pub struct Cli {
+    /// directory to serve (defaults to current directory)
+    #[arg(default_value = ".")]
+    pub directory: PathBuf,
+
+    /// port to listen on
+    #[arg(short, long, default_value_t = 69)]
+    pub port: u16,
+}
+
 fn main() {
-    println!("Hello, world!");
+    let cli = Cli::parse();
+
+    let dir = cli.directory.canonicalize().unwrap_or_else(|_| {
+        eprintln!(
+            "error: directory '{}' does not exist or is not readable",
+            cli.directory.display()
+        );
+        std::process::exit(1);
+    });
+
+    if !dir.is_dir() {
+        eprintln!("error: '{}' is not a directory", dir.display());
+        std::process::exit(1);
+    }
+
+    println!("serving {} on port {}", dir.display(), cli.port);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_defaults() {
+        let cli = Cli::parse_from(["tftpr"]);
+        assert_eq!(cli.directory, PathBuf::from("."));
+        assert_eq!(cli.port, 69);
+    }
+
+    #[test]
+    fn cli_custom_directory_and_port() {
+        let cli = Cli::parse_from(["tftpr", "/tmp", "-p", "1234"]);
+        assert_eq!(cli.directory, PathBuf::from("/tmp"));
+        assert_eq!(cli.port, 1234);
+    }
+
+    #[test]
+    fn cli_long_port_flag() {
+        let cli = Cli::parse_from(["tftpr", "--port", "8080"]);
+        assert_eq!(cli.port, 8080);
+    }
 }
