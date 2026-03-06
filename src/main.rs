@@ -1,4 +1,6 @@
+mod handler;
 mod packet;
+mod server;
 
 use std::path::PathBuf;
 
@@ -16,7 +18,8 @@ pub struct Cli {
     pub port: u16,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let cli = Cli::parse();
 
     let dir = cli.directory.canonicalize().unwrap_or_else(|_| {
@@ -33,6 +36,15 @@ fn main() {
     }
 
     println!("serving {} on port {}", dir.display(), cli.port);
+
+    let server = server::Server::bind(dir, cli.port)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("error: failed to bind to port {}: {e}", cli.port);
+            std::process::exit(1);
+        });
+
+    server.run().await;
 }
 
 #[cfg(test)]
@@ -58,4 +70,5 @@ mod tests {
         let cli = Cli::parse_from(["tftpr", "--port", "8080"]);
         assert_eq!(cli.port, 8080);
     }
+
 }
