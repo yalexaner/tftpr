@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: stable
+      - run: cargo test --locked
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo fmt --check
+
+  audit:
+    name: audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: taiki-e/install-action@3cb103a10a5f98c33952090281d3d89289c94db0 # cargo-deny
+        with:
+          tool: cargo-deny
+      - run: cargo deny --locked check
+
+  # --- future jobs ---
+  # enable these when the project is ready for them.
+
+  # coverage: uncomment when you want code coverage reports.
+  # requires: sign up at codecov.io, add CODECOV_TOKEN as a repo secret.
+  #
+  # coverage:
+  #   name: coverage
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v6
+  #     - uses: dtolnay/rust-toolchain@stable
+  #     - uses: taiki-e/install-action@cargo-llvm-cov
+  #     - run: cargo llvm-cov --codecov --output-path codecov.json
+  #     - uses: codecov/codecov-action@v5
+  #       with:
+  #         files: codecov.json
+  #         token: ${{ secrets.CODECOV_TOKEN }}
+
+  # semver-checks: uncomment when the crate is published to crates.io.
+  # catches accidental semver-breaking changes before release.
+  #
+  # semver-checks:
+  #   name: semver-checks
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v6
+  #     - uses: dtolnay/rust-toolchain@stable
+  #     - uses: taiki-e/install-action@cargo-semver-checks
+  #     - run: cargo semver-checks
