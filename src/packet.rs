@@ -6,6 +6,7 @@ const OP_WRQ: u16 = 2;
 const OP_DATA: u16 = 3;
 const OP_ACK: u16 = 4;
 const OP_ERROR: u16 = 5;
+const OP_OACK: u16 = 6;
 
 // TFTP error codes (RFC 1350)
 pub const ERR_NOT_DEFINED: u16 = 0;
@@ -32,11 +33,22 @@ pub enum PacketError {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Packet {
-    Rrq { filename: String, mode: String },
-    Wrq { filename: String, mode: String },
+    Rrq {
+        filename: String,
+        mode: String,
+        options: Vec<(String, String)>,
+    },
+    Wrq {
+        filename: String,
+        mode: String,
+        options: Vec<(String, String)>,
+    },
     Data { block_num: u16, data: Vec<u8> },
     Ack { block_num: u16 },
     Error { code: u16, message: String },
+    Oack {
+        options: Vec<(String, String)>,
+    },
 }
 
 impl Packet {
@@ -50,12 +62,20 @@ impl Packet {
 
         match opcode {
             OP_RRQ => {
-                let (filename, mode) = parse_request_fields(rest)?;
-                Ok(Packet::Rrq { filename, mode })
+                let (filename, mode, options) = parse_request_fields(rest)?;
+                Ok(Packet::Rrq {
+                    filename,
+                    mode,
+                    options,
+                })
             }
             OP_WRQ => {
-                let (filename, mode) = parse_request_fields(rest)?;
-                Ok(Packet::Wrq { filename, mode })
+                let (filename, mode, options) = parse_request_fields(rest)?;
+                Ok(Packet::Wrq {
+                    filename,
+                    mode,
+                    options,
+                })
             }
             OP_DATA => {
                 if rest.len() < 2 {
@@ -88,14 +108,26 @@ impl Packet {
                     .to_string();
                 Ok(Packet::Error { code, message })
             }
+            OP_OACK => {
+                let options = parse_option_pairs(rest)?;
+                Ok(Packet::Oack { options })
+            }
             other => Err(PacketError::UnknownOpcode(other)),
         }
     }
 
     pub fn encode(&self) -> Vec<u8> {
         match self {
-            Packet::Rrq { filename, mode } => encode_request(OP_RRQ, filename, mode),
-            Packet::Wrq { filename, mode } => encode_request(OP_WRQ, filename, mode),
+            Packet::Rrq {
+                filename,
+                mode,
+                options,
+            } => encode_request(OP_RRQ, filename, mode, options),
+            Packet::Wrq {
+                filename,
+                mode,
+                options,
+            } => encode_request(OP_WRQ, filename, mode, options),
             Packet::Data { block_num, data } => {
                 let mut buf = Vec::with_capacity(4 + data.len());
                 buf.extend_from_slice(&OP_DATA.to_be_bytes());
@@ -117,11 +149,24 @@ impl Packet {
                 buf.push(0);
                 buf
             }
+            Packet::Oack { options } => {
+                let mut buf = Vec::new();
+                buf.extend_from_slice(&OP_OACK.to_be_bytes());
+                for (key, value) in options {
+                    buf.extend_from_slice(key.as_bytes());
+                    buf.push(0);
+                    buf.extend_from_slice(value.as_bytes());
+                    buf.push(0);
+                }
+                buf
+            }
         }
     }
 }
 
-fn parse_request_fields(buf: &[u8]) -> Result<(String, String), PacketError> {
+type RequestFields = (String, String, Vec<(String, String)>);
+
+fn parse_request_fields(buf: &[u8]) -> Result<RequestFields, PacketError> {
     let first_null = buf
         .iter()
         .position(|&b| b == 0)
@@ -141,16 +186,67 @@ fn parse_request_fields(buf: &[u8]) -> Result<(String, String), PacketError> {
         .map_err(|_| PacketError::InvalidUtf8)?
         .to_string();
 
-    Ok((filename, mode))
+    // parse optional key/value pairs after the mode null terminator
+    let options_buf = &after_first[second_null + 1..];
+    let options = if options_buf.is_empty() {
+        Vec::new()
+    } else {
+        parse_option_pairs(options_buf)?
+    };
+
+    Ok((filename, mode, options))
 }
 
-fn encode_request(opcode: u16, filename: &str, mode: &str) -> Vec<u8> {
+/// parses null-terminated key/value option pairs from a buffer.
+/// expects pairs of `[key\0][value\0]` — an odd number of fields
+/// (i.e. a key without a matching value) is an error.
+fn parse_option_pairs(buf: &[u8]) -> Result<Vec<(String, String)>, PacketError> {
+    let mut options = Vec::new();
+    let mut pos = 0;
+
+    while pos < buf.len() {
+        let key_end = buf[pos..]
+            .iter()
+            .position(|&b| b == 0)
+            .ok_or(PacketError::MissingNullTerminator)?;
+        let key = std::str::from_utf8(&buf[pos..pos + key_end])
+            .map_err(|_| PacketError::InvalidUtf8)?
+            .to_string();
+        pos += key_end + 1;
+
+        if pos >= buf.len() {
+            // key without a value
+            return Err(PacketError::MissingNullTerminator);
+        }
+
+        let val_end = buf[pos..]
+            .iter()
+            .position(|&b| b == 0)
+            .ok_or(PacketError::MissingNullTerminator)?;
+        let value = std::str::from_utf8(&buf[pos..pos + val_end])
+            .map_err(|_| PacketError::InvalidUtf8)?
+            .to_string();
+        pos += val_end + 1;
+
+        options.push((key, value));
+    }
+
+    Ok(options)
+}
+
+fn encode_request(opcode: u16, filename: &str, mode: &str, options: &[(String, String)]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(4 + filename.len() + mode.len());
     buf.extend_from_slice(&opcode.to_be_bytes());
     buf.extend_from_slice(filename.as_bytes());
     buf.push(0);
     buf.extend_from_slice(mode.as_bytes());
     buf.push(0);
+    for (key, value) in options {
+        buf.extend_from_slice(key.as_bytes());
+        buf.push(0);
+        buf.extend_from_slice(value.as_bytes());
+        buf.push(0);
+    }
     buf
 }
 
@@ -165,6 +261,7 @@ mod tests {
         let pkt = Packet::Rrq {
             filename: "test.txt".into(),
             mode: "octet".into(),
+            options: vec![],
         };
         let encoded = pkt.encode();
         let decoded = Packet::decode(&encoded).unwrap();
@@ -176,6 +273,7 @@ mod tests {
         let pkt = Packet::Wrq {
             filename: "upload.bin".into(),
             mode: "netascii".into(),
+            options: vec![],
         };
         let encoded = pkt.encode();
         let decoded = Packet::decode(&encoded).unwrap();
@@ -244,6 +342,7 @@ mod tests {
         let pkt = Packet::Rrq {
             filename: "".into(),
             mode: "octet".into(),
+            options: vec![],
         };
         let encoded = pkt.encode();
         let decoded = Packet::decode(&encoded).unwrap();
@@ -332,6 +431,7 @@ mod tests {
         let pkt = Packet::Rrq {
             filename: "a".into(),
             mode: "octet".into(),
+            options: vec![],
         };
         let buf = pkt.encode();
         assert_eq!(buf[0..2], [0x00, 0x01]); // opcode
@@ -346,5 +446,162 @@ mod tests {
         let pkt = Packet::Ack { block_num: 0x0102 };
         let buf = pkt.encode();
         assert_eq!(buf, [0x00, 0x04, 0x01, 0x02]);
+    }
+
+    // OACK and options tests
+
+    #[test]
+    fn roundtrip_oack_empty_options() {
+        let pkt = Packet::Oack { options: vec![] };
+        let encoded = pkt.encode();
+        let decoded = Packet::decode(&encoded).unwrap();
+        assert_eq!(pkt, decoded);
+    }
+
+    #[test]
+    fn roundtrip_oack_single_option() {
+        let pkt = Packet::Oack {
+            options: vec![("blksize".into(), "1024".into())],
+        };
+        let encoded = pkt.encode();
+        let decoded = Packet::decode(&encoded).unwrap();
+        assert_eq!(pkt, decoded);
+    }
+
+    #[test]
+    fn roundtrip_oack_multiple_options() {
+        let pkt = Packet::Oack {
+            options: vec![
+                ("blksize".into(), "1024".into()),
+                ("tsize".into(), "65536".into()),
+            ],
+        };
+        let encoded = pkt.encode();
+        let decoded = Packet::decode(&encoded).unwrap();
+        assert_eq!(pkt, decoded);
+    }
+
+    #[test]
+    fn oack_wire_format() {
+        let pkt = Packet::Oack {
+            options: vec![("blksize".into(), "512".into())],
+        };
+        let buf = pkt.encode();
+        // [00 06] [blksize\0] [512\0]
+        assert_eq!(buf[0..2], [0x00, 0x06]);
+        assert_eq!(&buf[2..9], b"blksize");
+        assert_eq!(buf[9], 0x00);
+        assert_eq!(&buf[10..13], b"512");
+        assert_eq!(buf[13], 0x00);
+    }
+
+    #[test]
+    fn roundtrip_rrq_with_options() {
+        let pkt = Packet::Rrq {
+            filename: "test.txt".into(),
+            mode: "octet".into(),
+            options: vec![("blksize".into(), "1024".into())],
+        };
+        let encoded = pkt.encode();
+        let decoded = Packet::decode(&encoded).unwrap();
+        assert_eq!(pkt, decoded);
+    }
+
+    #[test]
+    fn roundtrip_wrq_with_options() {
+        let pkt = Packet::Wrq {
+            filename: "upload.bin".into(),
+            mode: "octet".into(),
+            options: vec![
+                ("blksize".into(), "8192".into()),
+                ("tsize".into(), "0".into()),
+            ],
+        };
+        let encoded = pkt.encode();
+        let decoded = Packet::decode(&encoded).unwrap();
+        assert_eq!(pkt, decoded);
+    }
+
+    #[test]
+    fn rrq_without_options_backward_compat() {
+        // raw wire bytes: RRQ without any options after mode
+        let mut buf = vec![0x00, 0x01]; // opcode
+        buf.extend_from_slice(b"file.txt");
+        buf.push(0);
+        buf.extend_from_slice(b"octet");
+        buf.push(0);
+        let decoded = Packet::decode(&buf).unwrap();
+        assert_eq!(
+            decoded,
+            Packet::Rrq {
+                filename: "file.txt".into(),
+                mode: "octet".into(),
+                options: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn wrq_without_options_backward_compat() {
+        let mut buf = vec![0x00, 0x02]; // opcode
+        buf.extend_from_slice(b"data.bin");
+        buf.push(0);
+        buf.extend_from_slice(b"octet");
+        buf.push(0);
+        let decoded = Packet::decode(&buf).unwrap();
+        assert_eq!(
+            decoded,
+            Packet::Wrq {
+                filename: "data.bin".into(),
+                mode: "octet".into(),
+                options: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn oack_malformed_odd_fields() {
+        // OACK with a key but no value (missing value null terminator)
+        let mut buf = vec![0x00, 0x06]; // opcode
+        buf.extend_from_slice(b"blksize");
+        buf.push(0);
+        // no value follows — key without value
+        assert!(matches!(
+            Packet::decode(&buf),
+            Err(PacketError::MissingNullTerminator)
+        ));
+    }
+
+    #[test]
+    fn oack_malformed_missing_null() {
+        // OACK with key but value has no null terminator
+        let mut buf = vec![0x00, 0x06]; // opcode
+        buf.extend_from_slice(b"blksize");
+        buf.push(0);
+        buf.extend_from_slice(b"1024"); // no trailing null
+        assert!(matches!(
+            Packet::decode(&buf),
+            Err(PacketError::MissingNullTerminator)
+        ));
+    }
+
+    #[test]
+    fn rrq_with_options_wire_format() {
+        let pkt = Packet::Rrq {
+            filename: "f".into(),
+            mode: "octet".into(),
+            options: vec![("blksize".into(), "1024".into())],
+        };
+        let buf = pkt.encode();
+        // [00 01][f\0][octet\0][blksize\0][1024\0]
+        assert_eq!(buf[0..2], [0x00, 0x01]);
+        assert_eq!(buf[2], b'f');
+        assert_eq!(buf[3], 0x00);
+        assert_eq!(&buf[4..9], b"octet");
+        assert_eq!(buf[9], 0x00);
+        assert_eq!(&buf[10..17], b"blksize");
+        assert_eq!(buf[17], 0x00);
+        assert_eq!(&buf[18..22], b"1024");
+        assert_eq!(buf[22], 0x00);
     }
 }
