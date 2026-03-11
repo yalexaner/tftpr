@@ -43,9 +43,17 @@ pub enum Packet {
         mode: String,
         options: Vec<(String, String)>,
     },
-    Data { block_num: u16, data: Vec<u8> },
-    Ack { block_num: u16 },
-    Error { code: u16, message: String },
+    Data {
+        block_num: u16,
+        data: Vec<u8>,
+    },
+    Ack {
+        block_num: u16,
+    },
+    Error {
+        code: u16,
+        message: String,
+    },
     Oack {
         options: Vec<(String, String)>,
     },
@@ -234,7 +242,12 @@ fn parse_option_pairs(buf: &[u8]) -> Result<Vec<(String, String)>, PacketError> 
     Ok(options)
 }
 
-fn encode_request(opcode: u16, filename: &str, mode: &str, options: &[(String, String)]) -> Vec<u8> {
+fn encode_request(
+    opcode: u16,
+    filename: &str,
+    mode: &str,
+    options: &[(String, String)],
+) -> Vec<u8> {
     let mut buf = Vec::with_capacity(4 + filename.len() + mode.len());
     buf.extend_from_slice(&opcode.to_be_bytes());
     buf.extend_from_slice(filename.as_bytes());

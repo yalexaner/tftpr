@@ -75,6 +75,23 @@ fn verify_fd_within_root(file: &File, root: &Path) -> Result<(), Packet> {
 const MAX_RETRIES: u32 = 3;
 const RETRY_TIMEOUT: Duration = Duration::from_secs(5);
 
+pub const DEFAULT_BLOCK_SIZE: usize = MAX_DATA_LEN;
+pub const MAX_BLOCK_SIZE: usize = 65464;
+
+/// finds the blksize option (case-insensitive), parses it, and caps at
+/// server_max. returns None if blksize is absent, non-numeric, below 512,
+/// or if the negotiated value equals the default 512 (sending OACK for the
+/// standard block size adds overhead with no benefit).
+pub fn negotiate_blksize(options: &[(String, String)], server_max: usize) -> Option<usize> {
+    options
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("blksize"))
+        .and_then(|(_, v)| v.parse::<usize>().ok())
+        .filter(|&requested| requested >= DEFAULT_BLOCK_SIZE)
+        .map(|requested| requested.min(server_max))
+        .filter(|&negotiated| negotiated > DEFAULT_BLOCK_SIZE)
+}
+
 /// resolves the requested filename against the root directory.
 /// rejects path traversal attempts by ensuring the resolved path
 /// stays within root.
@@ -185,8 +202,15 @@ fn resolve_path_for_write(root: &Path, filename: &str) -> Result<PathBuf, Packet
     Ok(full_path)
 }
 
-/// handles a read request: sends the file to the peer in 512-byte DATA blocks.
-pub async fn handle_rrq(root: &Path, socket: &UdpSocket, filename: &str) -> Result<(), Packet> {
+/// handles a read request: sends the file to the peer in DATA blocks.
+/// when negotiated_blksize is Some, sends an OACK first and waits for
+/// ACK(0) before transmitting data.
+pub async fn handle_rrq(
+    root: &Path,
+    socket: &UdpSocket,
+    filename: &str,
+    negotiated_blksize: Option<usize>,
+) -> Result<(), Packet> {
     let path = resolve_path(root, filename)?;
 
     let mut file = File::open(&path).await.map_err(|e| {
@@ -207,12 +231,19 @@ pub async fn handle_rrq(root: &Path, socket: &UdpSocket, filename: &str) -> Resu
     #[cfg(unix)]
     verify_fd_within_root(&file, root)?;
 
+    let block_size = negotiated_blksize.unwrap_or(DEFAULT_BLOCK_SIZE);
+
+    // send OACK if blksize was negotiated
+    if negotiated_blksize.is_some() && !send_oack(socket, block_size).await? {
+        return Ok(());
+    }
+
     let mut block_num: u16 = 1;
-    let mut buf = vec![0u8; MAX_DATA_LEN];
+    let mut buf = vec![0u8; block_size];
 
     loop {
         let mut bytes_read = 0;
-        while bytes_read < MAX_DATA_LEN {
+        while bytes_read < block_size {
             let n = file
                 .read(&mut buf[bytes_read..])
                 .await
@@ -276,8 +307,8 @@ pub async fn handle_rrq(root: &Path, socket: &UdpSocket, filename: &str) -> Resu
             });
         }
 
-        // last block: data < 512 bytes signals end of transfer
-        if bytes_read < MAX_DATA_LEN {
+        // last block: data smaller than block_size signals end of transfer
+        if bytes_read < block_size {
             break;
         }
 
@@ -293,8 +324,15 @@ pub async fn handle_rrq(root: &Path, socket: &UdpSocket, filename: &str) -> Resu
     Ok(())
 }
 
-/// handles a write request: receives the file from the peer in 512-byte DATA blocks.
-pub async fn handle_wrq(root: &Path, socket: &UdpSocket, filename: &str) -> Result<(), Packet> {
+/// handles a write request: receives the file from the peer in DATA blocks.
+/// when negotiated_blksize is Some, sends an OACK instead of ACK(0) and
+/// waits for DATA(1) as confirmation (per RFC 2347).
+pub async fn handle_wrq(
+    root: &Path,
+    socket: &UdpSocket,
+    filename: &str,
+    negotiated_blksize: Option<usize>,
+) -> Result<(), Packet> {
     let path = resolve_path_for_write(root, filename)?;
 
     // create file atomically before accepting the transfer
@@ -330,31 +368,53 @@ pub async fn handle_wrq(root: &Path, socket: &UdpSocket, filename: &str) -> Resu
         return Err(e);
     }
 
-    // send ACK 0 to accept the transfer
-    let ack0 = Packet::Ack { block_num: 0 };
-    socket
-        .send(&ack0.encode())
-        .await
-        .map_err(|_| Packet::Error {
-            code: packet::ERR_NOT_DEFINED,
-            message: "failed to send initial ACK".into(),
-        })?;
+    let block_size = negotiated_blksize.unwrap_or(DEFAULT_BLOCK_SIZE);
+
+    // per RFC 2347, OACK for WRQ is acknowledged by DATA(1), not ACK(0)
+    let mut first_data: Option<Vec<u8>> = None;
+
+    if negotiated_blksize.is_some() {
+        match send_oack_wrq(socket, block_size).await? {
+            Some(data) => first_data = Some(data),
+            None => {
+                // client rejected OACK — intentionally do NOT remove by
+                // pathname (same TOCTOU concern as the verify_fd failure
+                // path above). a leaked empty file is the lesser evil.
+                drop(file);
+                return Ok(());
+            }
+        }
+    } else {
+        // send ACK 0 to accept the transfer
+        let ack0 = Packet::Ack { block_num: 0 };
+        socket
+            .send(&ack0.encode())
+            .await
+            .map_err(|_| Packet::Error {
+                code: packet::ERR_NOT_DEFINED,
+                message: "failed to send initial ACK".into(),
+            })?;
+    }
 
     let mut expected_block: u16 = 1;
 
     loop {
-        // wait for DATA with retries
-        let data = match wait_for_data(socket, expected_block).await {
-            Ok(d) => d,
-            Err(client_error) => {
-                if client_error {
-                    // client sent ERROR - don't respond per RFC 1350 Section 5
-                    return Ok(());
+        // use pre-received DATA(1) from OACK handshake if available
+        let data = if let Some(d) = first_data.take() {
+            d
+        } else {
+            match wait_for_data(socket, expected_block, block_size).await {
+                Ok(d) => d,
+                Err(client_error) => {
+                    if client_error {
+                        // client sent ERROR - don't respond per RFC 1350 Section 5
+                        return Ok(());
+                    }
+                    return Err(Packet::Error {
+                        code: packet::ERR_NOT_DEFINED,
+                        message: "transfer timed out".into(),
+                    });
                 }
-                return Err(Packet::Error {
-                    code: packet::ERR_NOT_DEFINED,
-                    message: "transfer timed out".into(),
-                });
             }
         };
 
@@ -372,8 +432,8 @@ pub async fn handle_wrq(root: &Path, socket: &UdpSocket, filename: &str) -> Resu
             eprintln!("failed to send ACK for block {expected_block}: {e}");
         }
 
-        // last block: data < 512 bytes signals end of transfer
-        if data.len() < MAX_DATA_LEN {
+        // last block: data smaller than block_size signals end of transfer
+        if data.len() < block_size {
             break;
         }
 
@@ -398,7 +458,11 @@ pub async fn handle_wrq(root: &Path, socket: &UdpSocket, filename: &str) -> Resu
 /// uses a total deadline so stale/wrong packets cannot extend the wait indefinitely.
 /// returns Ok(data) on success, Err(true) if client sent ERROR (fatal),
 /// Err(false) on timeout after retries.
-async fn wait_for_data(socket: &UdpSocket, expected_block: u16) -> Result<Vec<u8>, bool> {
+async fn wait_for_data(
+    socket: &UdpSocket,
+    expected_block: u16,
+    block_size: usize,
+) -> Result<Vec<u8>, bool> {
     let deadline = tokio::time::Instant::now() + RETRY_TIMEOUT * MAX_RETRIES;
     let mut next_resend = tokio::time::Instant::now() + RETRY_TIMEOUT;
     loop {
@@ -410,10 +474,15 @@ async fn wait_for_data(socket: &UdpSocket, expected_block: u16) -> Result<Vec<u8
         let wait_until = next_resend.min(deadline);
         let remaining = wait_until.saturating_duration_since(now);
 
-        let mut recv_buf = [0u8; 4 + MAX_DATA_LEN];
+        // allocate 1 extra byte to detect oversized datagrams — UDP recv()
+        // silently truncates, so without this we'd write corrupt data
+        let mut recv_buf = vec![0u8; 4 + block_size + 1];
         let result = tokio::time::timeout(remaining, socket.recv(&mut recv_buf)).await;
 
         match result {
+            Ok(Ok(len)) if len > 4 + block_size => {
+                // oversized packet, skip it
+            }
             Ok(Ok(len)) => match Packet::decode(&recv_buf[..len]) {
                 Ok(Packet::Data { block_num, data }) if block_num == expected_block => {
                     return Ok(data);
@@ -464,6 +533,102 @@ async fn wait_for_ack(socket: &UdpSocket, expected_block: u16) -> Result<(), boo
             Ok(Packet::Ack { block_num }) if block_num == expected_block => return Ok(()),
             Ok(Packet::Error { .. }) => return Err(true),
             _ => continue, // stale/wrong-block ACK, keep waiting
+        }
+    }
+}
+
+/// sends an OACK for a WRQ and waits for DATA(1) — the RFC 2347
+/// acknowledgment for OACK in write transfers. retries up to MAX_RETRIES
+/// times on timeout.
+/// returns Ok(Some(data)) on success, Ok(None) if client rejected (sent ERROR).
+async fn send_oack_wrq(socket: &UdpSocket, block_size: usize) -> Result<Option<Vec<u8>>, Packet> {
+    let oack = Packet::Oack {
+        options: vec![("blksize".into(), block_size.to_string())],
+    };
+    let encoded = oack.encode();
+
+    let mut timeouts = 0u32;
+    loop {
+        if socket.send(&encoded).await.is_err() {
+            timeouts += 1;
+            if timeouts >= MAX_RETRIES {
+                return Err(Packet::Error {
+                    code: packet::ERR_NOT_DEFINED,
+                    message: "transfer timed out".into(),
+                });
+            }
+            continue;
+        }
+
+        let deadline = tokio::time::Instant::now() + RETRY_TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+
+            // allocate 1 extra byte to detect oversized datagrams — UDP recv()
+            // silently truncates, so without this we'd write corrupt data
+            let mut recv_buf = vec![0u8; 4 + block_size + 1];
+            match tokio::time::timeout(remaining, socket.recv(&mut recv_buf)).await {
+                Ok(Ok(len)) if len > 4 + block_size => continue, // oversized packet, skip
+                Ok(Ok(len)) => match Packet::decode(&recv_buf[..len]) {
+                    Ok(Packet::Data { block_num: 1, data }) => {
+                        return Ok(Some(data));
+                    }
+                    Ok(Packet::Error { .. }) => return Ok(None),
+                    _ => continue,
+                },
+                _ => break,
+            }
+        }
+
+        timeouts += 1;
+        if timeouts >= MAX_RETRIES {
+            return Err(Packet::Error {
+                code: packet::ERR_NOT_DEFINED,
+                message: "transfer timed out".into(),
+            });
+        }
+    }
+}
+
+/// sends an OACK with the negotiated block size and waits for ACK(0)
+/// confirmation. used for RRQ transfers. retries up to MAX_RETRIES
+/// times on timeout.
+/// returns Ok(true) on success, Ok(false) if the client rejected (sent ERROR).
+async fn send_oack(socket: &UdpSocket, block_size: usize) -> Result<bool, Packet> {
+    let oack = Packet::Oack {
+        options: vec![("blksize".into(), block_size.to_string())],
+    };
+    let encoded = oack.encode();
+
+    let mut timeouts = 0u32;
+    loop {
+        if socket.send(&encoded).await.is_err() {
+            timeouts += 1;
+            if timeouts >= MAX_RETRIES {
+                return Err(Packet::Error {
+                    code: packet::ERR_NOT_DEFINED,
+                    message: "transfer timed out".into(),
+                });
+            }
+            continue;
+        }
+
+        match wait_for_ack(socket, 0).await {
+            Ok(()) => return Ok(true),
+            Err(true) => return Ok(false),
+            Err(false) => {
+                timeouts += 1;
+                if timeouts >= MAX_RETRIES {
+                    return Err(Packet::Error {
+                        code: packet::ERR_NOT_DEFINED,
+                        message: "transfer timed out".into(),
+                    });
+                }
+                continue;
+            }
         }
     }
 }
@@ -535,7 +700,7 @@ mod tests {
 
         let root = dir.path().to_path_buf();
         let handle =
-            tokio::spawn(async move { handle_rrq(&root, &server_sock, "small.txt").await });
+            tokio::spawn(async move { handle_rrq(&root, &server_sock, "small.txt", None).await });
 
         // receive DATA block 1
         let mut buf = [0u8; 600];
@@ -573,7 +738,7 @@ mod tests {
 
         let root = dir.path().to_path_buf();
         let handle =
-            tokio::spawn(async move { handle_rrq(&root, &server_sock, "multi.bin").await });
+            tokio::spawn(async move { handle_rrq(&root, &server_sock, "multi.bin", None).await });
 
         let mut received = Vec::new();
 
@@ -622,7 +787,7 @@ mod tests {
             .unwrap();
 
         let root = dir.path().to_path_buf();
-        let result = handle_rrq(&root, &server_sock, "nope.txt").await;
+        let result = handle_rrq(&root, &server_sock, "nope.txt", None).await;
         let Err(Packet::Error { code, .. }) = result else {
             panic!("expected Packet::Error, got {result:?}");
         };
@@ -643,7 +808,7 @@ mod tests {
             .unwrap();
 
         let root = dir.path().to_path_buf();
-        let result = handle_rrq(&root, &server_sock, "../etc/passwd").await;
+        let result = handle_rrq(&root, &server_sock, "../etc/passwd", None).await;
         let Err(Packet::Error { code, .. }) = result else {
             panic!("expected Packet::Error, got {result:?}");
         };
@@ -666,7 +831,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(MAX_RETRIES as u64 * RETRY_TIMEOUT.as_secs() + 5),
-            handle_rrq(&root, &server_sock, "timeout.txt"),
+            handle_rrq(&root, &server_sock, "timeout.txt", None),
         )
         .await
         .unwrap();
@@ -703,7 +868,9 @@ mod tests {
 
         let root = dir.path().to_path_buf();
         let handle =
-            tokio::spawn(async move { handle_wrq(&root, &server_sock, "uploaded.txt").await });
+            tokio::spawn(
+                async move { handle_wrq(&root, &server_sock, "uploaded.txt", None).await },
+            );
 
         // receive ACK 0
         let mut buf = [0u8; 600];
@@ -750,7 +917,7 @@ mod tests {
         let root = dir.path().to_path_buf();
         let content_clone = content.clone();
         let handle =
-            tokio::spawn(async move { handle_wrq(&root, &server_sock, "multi.bin").await });
+            tokio::spawn(async move { handle_wrq(&root, &server_sock, "multi.bin", None).await });
 
         let mut buf = [0u8; 600];
 
@@ -813,7 +980,7 @@ mod tests {
         let (dir, server_sock, _client_sock) = setup_wrq().await;
         let root = dir.path().to_path_buf();
 
-        let result = handle_wrq(&root, &server_sock, "../evil.txt").await;
+        let result = handle_wrq(&root, &server_sock, "../evil.txt", None).await;
         let Err(Packet::Error { code, .. }) = result else {
             panic!("expected Packet::Error, got {result:?}");
         };
@@ -825,7 +992,7 @@ mod tests {
         let (dir, server_sock, _client_sock) = setup_wrq().await;
         let root = dir.path().to_path_buf();
 
-        let result = handle_wrq(&root, &server_sock, "/tmp/evil.txt").await;
+        let result = handle_wrq(&root, &server_sock, "/tmp/evil.txt", None).await;
         let Err(Packet::Error { code, .. }) = result else {
             panic!("expected Packet::Error, got {result:?}");
         };
@@ -839,7 +1006,7 @@ mod tests {
         std::fs::write(dir.path().join("exists.txt"), b"already here").unwrap();
 
         let root = dir.path().to_path_buf();
-        let result = handle_wrq(&root, &server_sock, "exists.txt").await;
+        let result = handle_wrq(&root, &server_sock, "exists.txt", None).await;
         let Err(Packet::Error { code, message }) = result else {
             panic!("expected Packet::Error, got {result:?}");
         };
@@ -914,7 +1081,7 @@ mod tests {
         let root = dir.path().to_path_buf();
         let result = tokio::time::timeout(
             Duration::from_secs(MAX_RETRIES as u64 * RETRY_TIMEOUT.as_secs() + 5),
-            handle_wrq(&root, &server_sock, "timeout.txt"),
+            handle_wrq(&root, &server_sock, "timeout.txt", None),
         )
         .await
         .unwrap();
@@ -928,5 +1095,359 @@ mod tests {
         // partial file is intentionally NOT cleaned up by pathname to prevent
         // symlink-swap attacks (see comment in handle_wrq verify_fd_within_root path)
         assert!(dir.path().join("timeout.txt").exists());
+    }
+
+    // --- blksize negotiation unit tests ---
+
+    #[test]
+    fn negotiate_blksize_above_server_max() {
+        let options = vec![("blksize".into(), "8192".into())];
+        let result = negotiate_blksize(&options, 4096);
+        assert_eq!(result, Some(4096));
+    }
+
+    #[test]
+    fn negotiate_blksize_clamped_to_default_returns_none() {
+        // when server_max=512, negotiation yields 512 which equals the default
+        // block size — no point sending OACK for the standard size
+        let options = vec![("blksize".into(), "1024".into())];
+        let result = negotiate_blksize(&options, DEFAULT_BLOCK_SIZE);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn negotiate_blksize_exact_default_returns_none() {
+        // client explicitly requests 512 — still no OACK needed
+        let options = vec![("blksize".into(), "512".into())];
+        let result = negotiate_blksize(&options, 65464);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn negotiate_blksize_below_minimum() {
+        // sub-512 requests are declined (None) rather than clamped up,
+        // because RFC 2348 requires server response <= client request
+        let options = vec![("blksize".into(), "256".into())];
+        let result = negotiate_blksize(&options, 65464);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn negotiate_blksize_invalid_non_numeric() {
+        let options = vec![("blksize".into(), "abc".into())];
+        let result = negotiate_blksize(&options, 65464);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn negotiate_blksize_no_option() {
+        let options: Vec<(String, String)> = vec![];
+        let result = negotiate_blksize(&options, 65464);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn negotiate_blksize_case_insensitive() {
+        let options = vec![("BLKSIZE".into(), "1024".into())];
+        let result = negotiate_blksize(&options, 65464);
+        assert_eq!(result, Some(1024));
+    }
+
+    #[test]
+    fn negotiate_blksize_within_range() {
+        let options = vec![("blksize".into(), "1024".into())];
+        let result = negotiate_blksize(&options, 8192);
+        assert_eq!(result, Some(1024));
+    }
+
+    // --- blksize integration tests ---
+
+    #[tokio::test]
+    async fn rrq_with_blksize_sends_oack() {
+        let content = b"hello, negotiated blksize!";
+        let (dir, server_sock, client_sock) = setup("blksize_rrq.txt", content).await;
+        let root = dir.path().to_path_buf();
+
+        let handle = tokio::spawn(async move {
+            handle_rrq(&root, &server_sock, "blksize_rrq.txt", Some(1024)).await
+        });
+
+        // receive OACK
+        let mut buf = [0u8; 600];
+        let len = tokio::time::timeout(Duration::from_secs(2), client_sock.recv(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let pkt = Packet::decode(&buf[..len]).unwrap();
+        match &pkt {
+            Packet::Oack { options } => {
+                assert_eq!(options, &vec![("blksize".into(), "1024".into())]);
+            }
+            other => panic!("expected OACK, got {other:?}"),
+        }
+
+        // send ACK(0) to confirm OACK
+        let ack0 = Packet::Ack { block_num: 0 };
+        client_sock.send(&ack0.encode()).await.unwrap();
+
+        // receive DATA(1) - entire content fits in one block (< 1024 bytes)
+        let len = tokio::time::timeout(Duration::from_secs(2), client_sock.recv(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let pkt = Packet::decode(&buf[..len]).unwrap();
+        match &pkt {
+            Packet::Data { block_num, data } => {
+                assert_eq!(*block_num, 1);
+                assert_eq!(data, content);
+            }
+            other => panic!("expected Data, got {other:?}"),
+        }
+
+        // send ACK(1)
+        let ack1 = Packet::Ack { block_num: 1 };
+        client_sock.send(&ack1.encode()).await.unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn wrq_with_blksize_sends_oack() {
+        let (dir, server_sock, client_sock) = setup_wrq().await;
+        let content = b"hello upload with blksize!";
+        let root = dir.path().to_path_buf();
+
+        let handle = tokio::spawn(async move {
+            handle_wrq(&root, &server_sock, "blk_upload.txt", Some(1024)).await
+        });
+
+        // receive OACK (instead of ACK 0)
+        let mut buf = [0u8; 600];
+        let len = tokio::time::timeout(Duration::from_secs(2), client_sock.recv(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let pkt = Packet::decode(&buf[..len]).unwrap();
+        match &pkt {
+            Packet::Oack { options } => {
+                assert_eq!(options, &vec![("blksize".into(), "1024".into())]);
+            }
+            other => panic!("expected OACK, got {other:?}"),
+        }
+
+        // per RFC 2347, client acknowledges OACK for WRQ by sending DATA(1)
+        let data_pkt = Packet::Data {
+            block_num: 1,
+            data: content.to_vec(),
+        };
+        client_sock.send(&data_pkt.encode()).await.unwrap();
+
+        // receive ACK(1)
+        let len = tokio::time::timeout(Duration::from_secs(2), client_sock.recv(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let pkt = Packet::decode(&buf[..len]).unwrap();
+        assert_eq!(pkt, Packet::Ack { block_num: 1 });
+
+        let result = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_ok());
+
+        let written = std::fs::read(dir.path().join("blk_upload.txt")).unwrap();
+        assert_eq!(written, content);
+    }
+
+    #[tokio::test]
+    async fn rrq_no_blksize_no_oack() {
+        // backward compat: no blksize option means no OACK, standard 512 transfer
+        let content = b"backward compat test";
+        let (dir, server_sock, client_sock) = setup("noopt.txt", content).await;
+        let root = dir.path().to_path_buf();
+
+        let handle =
+            tokio::spawn(async move { handle_rrq(&root, &server_sock, "noopt.txt", None).await });
+
+        // should receive DATA(1) directly (no OACK)
+        let mut buf = [0u8; 600];
+        let len = tokio::time::timeout(Duration::from_secs(2), client_sock.recv(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let pkt = Packet::decode(&buf[..len]).unwrap();
+        match &pkt {
+            Packet::Data { block_num, data } => {
+                assert_eq!(*block_num, 1);
+                assert_eq!(data, content);
+            }
+            other => panic!("expected Data (no OACK), got {other:?}"),
+        }
+
+        let ack1 = Packet::Ack { block_num: 1 };
+        client_sock.send(&ack1.encode()).await.unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn rrq_with_blksize_multi_block() {
+        let block_size = 1024;
+        // 1124 bytes = 1 full block (1024) + 100 bytes (last block < blksize)
+        let content = vec![0xAB; block_size + 100];
+        let (dir, server_sock, client_sock) = setup("blkmulti.bin", &content).await;
+        let root = dir.path().to_path_buf();
+
+        let handle = tokio::spawn(async move {
+            handle_rrq(&root, &server_sock, "blkmulti.bin", Some(block_size)).await
+        });
+
+        let mut buf = vec![0u8; 4 + block_size];
+
+        // receive OACK
+        let len = tokio::time::timeout(Duration::from_secs(2), client_sock.recv(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let pkt = Packet::decode(&buf[..len]).unwrap();
+        assert!(matches!(pkt, Packet::Oack { .. }));
+
+        // send ACK(0)
+        client_sock
+            .send(&Packet::Ack { block_num: 0 }.encode())
+            .await
+            .unwrap();
+
+        let mut received = Vec::new();
+
+        // receive DATA(1) - full block
+        let len = tokio::time::timeout(Duration::from_secs(2), client_sock.recv(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        match Packet::decode(&buf[..len]).unwrap() {
+            Packet::Data { block_num, data } => {
+                assert_eq!(block_num, 1);
+                assert_eq!(data.len(), block_size);
+                received.extend_from_slice(&data);
+            }
+            other => panic!("expected Data block 1, got {other:?}"),
+        }
+        client_sock
+            .send(&Packet::Ack { block_num: 1 }.encode())
+            .await
+            .unwrap();
+
+        // receive DATA(2) - last block (< block_size)
+        let len = tokio::time::timeout(Duration::from_secs(2), client_sock.recv(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        match Packet::decode(&buf[..len]).unwrap() {
+            Packet::Data { block_num, data } => {
+                assert_eq!(block_num, 2);
+                assert_eq!(data.len(), 100);
+                received.extend_from_slice(&data);
+            }
+            other => panic!("expected Data block 2, got {other:?}"),
+        }
+        client_sock
+            .send(&Packet::Ack { block_num: 2 }.encode())
+            .await
+            .unwrap();
+
+        assert_eq!(received, content);
+
+        let result = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn wrq_with_blksize_multi_block() {
+        let (dir, server_sock, client_sock) = setup_wrq().await;
+        let block_size = 1024;
+        // 1124 bytes = 1 full block (1024) + 100 bytes (last block < blksize)
+        let content: Vec<u8> = (0..block_size + 100).map(|i| (i % 256) as u8).collect();
+        let root = dir.path().to_path_buf();
+
+        let handle = tokio::spawn(async move {
+            handle_wrq(
+                &root,
+                &server_sock,
+                "blk_multi_upload.bin",
+                Some(block_size),
+            )
+            .await
+        });
+
+        // receive OACK
+        let mut buf = vec![0u8; 4 + block_size];
+        let len = tokio::time::timeout(Duration::from_secs(2), client_sock.recv(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let pkt = Packet::decode(&buf[..len]).unwrap();
+        match &pkt {
+            Packet::Oack { options } => {
+                assert_eq!(options, &vec![("blksize".into(), "1024".into())]);
+            }
+            other => panic!("expected OACK, got {other:?}"),
+        }
+
+        // per RFC 2347, WRQ OACK is confirmed by sending DATA(1), not ACK(0)
+        // send DATA(1) - full block (1024 bytes)
+        let data1 = Packet::Data {
+            block_num: 1,
+            data: content[..block_size].to_vec(),
+        };
+        client_sock.send(&data1.encode()).await.unwrap();
+
+        // receive ACK(1)
+        let len = tokio::time::timeout(Duration::from_secs(2), client_sock.recv(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            Packet::decode(&buf[..len]).unwrap(),
+            Packet::Ack { block_num: 1 }
+        );
+
+        // send DATA(2) - last block (100 bytes < 1024)
+        let data2 = Packet::Data {
+            block_num: 2,
+            data: content[block_size..].to_vec(),
+        };
+        client_sock.send(&data2.encode()).await.unwrap();
+
+        // receive ACK(2)
+        let len = tokio::time::timeout(Duration::from_secs(2), client_sock.recv(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            Packet::decode(&buf[..len]).unwrap(),
+            Packet::Ack { block_num: 2 }
+        );
+
+        let result = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_ok());
+
+        let written = std::fs::read(dir.path().join("blk_multi_upload.bin")).unwrap();
+        assert_eq!(written, content);
     }
 }

@@ -16,6 +16,10 @@ pub struct Cli {
     /// port to listen on
     #[arg(short, long, default_value_t = 69)]
     pub port: u16,
+
+    /// maximum block size for blksize option negotiation (512-65464)
+    #[arg(short = 'b', long = "blksize", default_value_t = 512)]
+    pub blksize: usize,
 }
 
 #[tokio::main]
@@ -35,9 +39,14 @@ async fn main() {
         std::process::exit(1);
     }
 
+    if cli.blksize < handler::DEFAULT_BLOCK_SIZE || cli.blksize > handler::MAX_BLOCK_SIZE {
+        eprintln!("error: blksize must be between 512 and 65464");
+        std::process::exit(1);
+    }
+
     println!("serving {} on port {}", dir.display(), cli.port);
 
-    let server = server::Server::bind(dir, cli.port)
+    let server = server::Server::bind(dir, cli.port, cli.blksize)
         .await
         .unwrap_or_else(|e| {
             eprintln!("error: failed to bind to port {}: {e}", cli.port);
@@ -56,6 +65,7 @@ mod tests {
         let cli = Cli::parse_from(["tftpr"]);
         assert_eq!(cli.directory, PathBuf::from("."));
         assert_eq!(cli.port, 69);
+        assert_eq!(cli.blksize, 512);
     }
 
     #[test]
@@ -69,5 +79,17 @@ mod tests {
     fn cli_long_port_flag() {
         let cli = Cli::parse_from(["tftpr", "--port", "8080"]);
         assert_eq!(cli.port, 8080);
+    }
+
+    #[test]
+    fn cli_blksize_flag() {
+        let cli = Cli::parse_from(["tftpr", "-b", "1024"]);
+        assert_eq!(cli.blksize, 1024);
+    }
+
+    #[test]
+    fn cli_long_blksize_flag() {
+        let cli = Cli::parse_from(["tftpr", "--blksize", "8192"]);
+        assert_eq!(cli.blksize, 8192);
     }
 }

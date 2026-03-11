@@ -14,20 +14,26 @@ pub struct Server {
     root: PathBuf,
     socket: UdpSocket,
     transfer_semaphore: Arc<Semaphore>,
+    max_block_size: usize,
 }
 
 impl Server {
-    pub async fn bind(root: PathBuf, port: u16) -> std::io::Result<Self> {
+    pub async fn bind(root: PathBuf, port: u16, max_block_size: usize) -> std::io::Result<Self> {
         let addr: SocketAddr = ([0, 0, 0, 0], port).into();
-        Self::bind_addr(root, addr).await
+        Self::bind_addr(root, addr, max_block_size).await
     }
 
-    async fn bind_addr(root: PathBuf, addr: SocketAddr) -> std::io::Result<Self> {
+    async fn bind_addr(
+        root: PathBuf,
+        addr: SocketAddr,
+        max_block_size: usize,
+    ) -> std::io::Result<Self> {
         let socket = UdpSocket::bind(addr).await?;
         Ok(Server {
             root,
             socket,
             transfer_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_TRANSFERS)),
+            max_block_size,
         })
     }
 
@@ -77,9 +83,10 @@ impl Server {
                     };
                     let root = self.root.clone();
                     let pkt = packet.clone();
+                    let max_block_size = self.max_block_size;
                     tokio::spawn(async move {
                         let _permit = permit;
-                        if let Err(e) = handle_request(root, peer, pkt).await {
+                        if let Err(e) = handle_request(root, peer, pkt, max_block_size).await {
                             eprintln!("transfer error for {peer}: {e}");
                         }
                     });
@@ -96,30 +103,45 @@ impl Server {
     }
 }
 
-async fn handle_request(root: PathBuf, peer: SocketAddr, packet: Packet) -> std::io::Result<()> {
+async fn handle_request(
+    root: PathBuf,
+    peer: SocketAddr,
+    packet: Packet,
+    max_block_size: usize,
+) -> std::io::Result<()> {
     // bind ephemeral socket for this transfer
     let transfer_socket = UdpSocket::bind("0.0.0.0:0").await?;
     transfer_socket.connect(peer).await?;
 
     let result = match packet {
-        Packet::Rrq { filename, mode } => {
+        Packet::Rrq {
+            filename,
+            mode,
+            options,
+        } => {
             if !mode.eq_ignore_ascii_case("octet") {
                 Err(Packet::Error {
                     code: packet::ERR_ILLEGAL_OPERATION,
                     message: "only octet mode is supported".into(),
                 })
             } else {
-                handler::handle_rrq(&root, &transfer_socket, &filename).await
+                let negotiated_blksize = handler::negotiate_blksize(&options, max_block_size);
+                handler::handle_rrq(&root, &transfer_socket, &filename, negotiated_blksize).await
             }
         }
-        Packet::Wrq { filename, mode } => {
+        Packet::Wrq {
+            filename,
+            mode,
+            options,
+        } => {
             if !mode.eq_ignore_ascii_case("octet") {
                 Err(Packet::Error {
                     code: packet::ERR_ILLEGAL_OPERATION,
                     message: "only octet mode is supported".into(),
                 })
             } else {
-                handler::handle_wrq(&root, &transfer_socket, &filename).await
+                let negotiated_blksize = handler::negotiate_blksize(&options, max_block_size);
+                handler::handle_wrq(&root, &transfer_socket, &filename, negotiated_blksize).await
             }
         }
         _ => return Ok(()),
@@ -141,7 +163,9 @@ mod tests {
 
     async fn test_server() -> Server {
         let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
-        Server::bind_addr(PathBuf::from("."), addr).await.unwrap()
+        Server::bind_addr(PathBuf::from("."), addr, handler::DEFAULT_BLOCK_SIZE)
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -153,7 +177,9 @@ mod tests {
 
     #[tokio::test]
     async fn server_bind_public() {
-        let server = Server::bind(PathBuf::from("."), 0).await.unwrap();
+        let server = Server::bind(PathBuf::from("."), 0, handler::DEFAULT_BLOCK_SIZE)
+            .await
+            .unwrap();
         let addr = server.local_addr().unwrap();
         assert_ne!(addr.port(), 0);
     }
@@ -240,7 +266,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
-        let server = Server::bind_addr(dir.path().to_path_buf(), addr)
+        let server = Server::bind_addr(dir.path().to_path_buf(), addr, handler::DEFAULT_BLOCK_SIZE)
             .await
             .unwrap();
         let server_addr = server.local_addr().unwrap();
@@ -257,6 +283,7 @@ mod tests {
         let wrq = Packet::Wrq {
             filename: "upload.txt".into(),
             mode: "octet".into(),
+            options: vec![],
         };
         client.send_to(&wrq.encode(), server_addr).await.unwrap();
 
@@ -284,7 +311,7 @@ mod tests {
         std::fs::write(dir.path().join("exists.txt"), b"data").unwrap();
 
         let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
-        let server = Server::bind_addr(dir.path().to_path_buf(), addr)
+        let server = Server::bind_addr(dir.path().to_path_buf(), addr, handler::DEFAULT_BLOCK_SIZE)
             .await
             .unwrap();
         let server_addr = server.local_addr().unwrap();
@@ -300,6 +327,7 @@ mod tests {
         let wrq = Packet::Wrq {
             filename: "exists.txt".into(),
             mode: "octet".into(),
+            options: vec![],
         };
         client.send_to(&wrq.encode(), server_addr).await.unwrap();
 
@@ -331,7 +359,7 @@ mod tests {
         std::fs::write(dir.path().join("test.txt"), b"hello").unwrap();
 
         let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
-        let server = Server::bind_addr(dir.path().to_path_buf(), addr)
+        let server = Server::bind_addr(dir.path().to_path_buf(), addr, handler::DEFAULT_BLOCK_SIZE)
             .await
             .unwrap();
         let server_addr = server.local_addr().unwrap();
@@ -348,6 +376,7 @@ mod tests {
         let rrq = Packet::Rrq {
             filename: "test.txt".into(),
             mode: "octet".into(),
+            options: vec![],
         };
         client.send_to(&rrq.encode(), server_addr).await.unwrap();
 
@@ -369,6 +398,77 @@ mod tests {
             Packet::Data { block_num, data } => {
                 assert_eq!(block_num, 1);
                 assert_eq!(data, b"hello");
+            }
+            other => panic!("expected Data packet, got {other:?}"),
+        }
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn rrq_with_blksize_dispatches_oack() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("blk.txt"), b"negotiated transfer").unwrap();
+
+        let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
+        let server = Server::bind_addr(dir.path().to_path_buf(), addr, 1024)
+            .await
+            .unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let server = Arc::new(server);
+        let s = server.clone();
+        let handle = tokio::spawn(async move {
+            s.run().await;
+        });
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        // send RRQ with blksize option
+        let rrq = Packet::Rrq {
+            filename: "blk.txt".into(),
+            mode: "octet".into(),
+            options: vec![("blksize".into(), "1024".into())],
+        };
+        client.send_to(&rrq.encode(), server_addr).await.unwrap();
+
+        // should receive OACK from ephemeral port
+        let mut buf = [0u8; 600];
+        let (len, from) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .expect("timed out waiting for OACK")
+        .unwrap();
+
+        assert_ne!(from.port(), server_addr.port());
+        let pkt = Packet::decode(&buf[..len]).unwrap();
+        match &pkt {
+            Packet::Oack { options } => {
+                assert_eq!(options, &vec![("blksize".into(), "1024".into())]);
+            }
+            other => panic!("expected OACK, got {other:?}"),
+        }
+
+        // send ACK(0) to confirm OACK (to ephemeral port)
+        let ack0 = Packet::Ack { block_num: 0 };
+        client.send_to(&ack0.encode(), from).await.unwrap();
+
+        // receive DATA(1)
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .expect("timed out waiting for DATA")
+        .unwrap();
+
+        let pkt = Packet::decode(&buf[..len]).unwrap();
+        match pkt {
+            Packet::Data { block_num, data } => {
+                assert_eq!(block_num, 1);
+                assert_eq!(data, b"negotiated transfer");
             }
             other => panic!("expected Data packet, got {other:?}"),
         }
