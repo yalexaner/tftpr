@@ -75,6 +75,16 @@ fn verify_fd_within_root(file: &File, root: &Path) -> Result<(), Packet> {
 const MAX_RETRIES: u32 = 3;
 const RETRY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// outcome of a file transfer operation.
+#[derive(Debug)]
+pub enum TransferOutcome {
+    /// transfer completed normally with the given byte count.
+    Complete(u64),
+    /// client sent an ERROR packet, aborting the transfer.
+    /// the byte count reflects bytes confirmed before the abort.
+    Aborted(u64),
+}
+
 /// resolves the requested filename against the root directory.
 /// rejects path traversal attempts by ensuring the resolved path
 /// stays within root.
@@ -186,7 +196,11 @@ fn resolve_path_for_write(root: &Path, filename: &str) -> Result<PathBuf, Packet
 }
 
 /// handles a read request: sends the file to the peer in 512-byte DATA blocks.
-pub async fn handle_rrq(root: &Path, socket: &UdpSocket, filename: &str) -> Result<(), Packet> {
+pub async fn handle_rrq(
+    root: &Path,
+    socket: &UdpSocket,
+    filename: &str,
+) -> Result<TransferOutcome, Packet> {
     let path = resolve_path(root, filename)?;
 
     let mut file = File::open(&path).await.map_err(|e| {
@@ -209,6 +223,7 @@ pub async fn handle_rrq(root: &Path, socket: &UdpSocket, filename: &str) -> Resu
 
     let mut block_num: u16 = 1;
     let mut buf = vec![0u8; MAX_DATA_LEN];
+    let mut total_bytes: u64 = 0;
 
     loop {
         let mut bytes_read = 0;
@@ -266,7 +281,7 @@ pub async fn handle_rrq(root: &Path, socket: &UdpSocket, filename: &str) -> Resu
 
         if client_error {
             // client sent ERROR - don't respond per RFC 1350 Section 5
-            return Ok(());
+            return Ok(TransferOutcome::Aborted(total_bytes));
         }
 
         if !acked {
@@ -275,6 +290,8 @@ pub async fn handle_rrq(root: &Path, socket: &UdpSocket, filename: &str) -> Resu
                 message: "transfer timed out".into(),
             });
         }
+
+        total_bytes += bytes_read as u64;
 
         // last block: data < 512 bytes signals end of transfer
         if bytes_read < MAX_DATA_LEN {
@@ -290,11 +307,15 @@ pub async fn handle_rrq(root: &Path, socket: &UdpSocket, filename: &str) -> Resu
         block_num += 1;
     }
 
-    Ok(())
+    Ok(TransferOutcome::Complete(total_bytes))
 }
 
 /// handles a write request: receives the file from the peer in 512-byte DATA blocks.
-pub async fn handle_wrq(root: &Path, socket: &UdpSocket, filename: &str) -> Result<(), Packet> {
+pub async fn handle_wrq(
+    root: &Path,
+    socket: &UdpSocket,
+    filename: &str,
+) -> Result<TransferOutcome, Packet> {
     let path = resolve_path_for_write(root, filename)?;
 
     // create file atomically before accepting the transfer
@@ -341,6 +362,7 @@ pub async fn handle_wrq(root: &Path, socket: &UdpSocket, filename: &str) -> Resu
         })?;
 
     let mut expected_block: u16 = 1;
+    let mut total_bytes: u64 = 0;
 
     loop {
         // wait for DATA with retries
@@ -349,7 +371,7 @@ pub async fn handle_wrq(root: &Path, socket: &UdpSocket, filename: &str) -> Resu
             Err(client_error) => {
                 if client_error {
                     // client sent ERROR - don't respond per RFC 1350 Section 5
-                    return Ok(());
+                    return Ok(TransferOutcome::Aborted(total_bytes));
                 }
                 return Err(Packet::Error {
                     code: packet::ERR_NOT_DEFINED,
@@ -363,6 +385,8 @@ pub async fn handle_wrq(root: &Path, socket: &UdpSocket, filename: &str) -> Resu
             code: packet::ERR_DISK_FULL,
             message: "disk write failed".into(),
         })?;
+
+        total_bytes += data.len() as u64;
 
         // send ACK for this block
         let ack = Packet::Ack {
@@ -391,7 +415,7 @@ pub async fn handle_wrq(root: &Path, socket: &UdpSocket, filename: &str) -> Resu
         message: "disk write failed".into(),
     })?;
 
-    Ok(())
+    Ok(TransferOutcome::Complete(total_bytes))
 }
 
 /// waits for a DATA packet with the expected block number, with retries and timeout.
@@ -557,12 +581,15 @@ mod tests {
         let ack = Packet::Ack { block_num: 1 };
         client_sock.send(&ack.encode()).await.unwrap();
 
-        // handler should complete successfully
+        // handler should complete successfully with correct byte count
         let result = tokio::time::timeout(Duration::from_secs(2), handle)
             .await
             .unwrap()
             .unwrap();
-        assert!(result.is_ok());
+        let TransferOutcome::Complete(bytes) = result.unwrap() else {
+            panic!("expected Complete");
+        };
+        assert_eq!(bytes, content.len() as u64);
     }
 
     #[tokio::test]
@@ -605,7 +632,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(result.is_ok());
+        let TransferOutcome::Complete(bytes) = result.unwrap() else {
+            panic!("expected Complete");
+        };
+        assert_eq!(bytes, content.len() as u64);
     }
 
     #[tokio::test]
@@ -729,12 +759,15 @@ mod tests {
         let pkt = Packet::decode(&buf[..len]).unwrap();
         assert_eq!(pkt, Packet::Ack { block_num: 1 });
 
-        // handler should complete
+        // handler should complete with correct byte count
         let result = tokio::time::timeout(Duration::from_secs(2), handle)
             .await
             .unwrap()
             .unwrap();
-        assert!(result.is_ok());
+        let TransferOutcome::Complete(bytes) = result.unwrap() else {
+            panic!("expected Complete");
+        };
+        assert_eq!(bytes, content.len() as u64);
 
         // verify file was written
         let written = std::fs::read(dir.path().join("uploaded.txt")).unwrap();
@@ -802,7 +835,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(result.is_ok());
+        let TransferOutcome::Complete(bytes) = result.unwrap() else {
+            panic!("expected Complete");
+        };
+        assert_eq!(bytes, content.len() as u64);
 
         let written = std::fs::read(dir.path().join("multi.bin")).unwrap();
         assert_eq!(written, content);
@@ -928,5 +964,218 @@ mod tests {
         // partial file is intentionally NOT cleaned up by pathname to prevent
         // symlink-swap attacks (see comment in handle_wrq verify_fd_within_root path)
         assert!(dir.path().join("timeout.txt").exists());
+    }
+
+    // --- client error byte count tests ---
+
+    #[tokio::test]
+    async fn rrq_byte_count_on_client_error() {
+        // 600 bytes = 1 full block (512) + 1 partial block (88)
+        let content = vec![0x55; 600];
+        let (dir, server_sock, client_sock) = setup("error_mid.bin", &content).await;
+
+        let root = dir.path().to_path_buf();
+        let handle =
+            tokio::spawn(async move { handle_rrq(&root, &server_sock, "error_mid.bin").await });
+
+        // receive DATA block 1
+        let mut buf = [0u8; 600];
+        let len = tokio::time::timeout(Duration::from_secs(2), client_sock.recv(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let pkt = Packet::decode(&buf[..len]).unwrap();
+        assert!(matches!(pkt, Packet::Data { block_num: 1, .. }));
+
+        // ACK block 1
+        let ack = Packet::Ack { block_num: 1 };
+        client_sock.send(&ack.encode()).await.unwrap();
+
+        // receive DATA block 2
+        let len = tokio::time::timeout(Duration::from_secs(2), client_sock.recv(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let pkt = Packet::decode(&buf[..len]).unwrap();
+        assert!(matches!(pkt, Packet::Data { block_num: 2, .. }));
+
+        // send ERROR instead of ACK
+        let err_pkt = Packet::Error {
+            code: packet::ERR_NOT_DEFINED,
+            message: "client abort".into(),
+        };
+        client_sock.send(&err_pkt.encode()).await.unwrap();
+
+        // handler should return Aborted with partial byte count (only block 1 was acked)
+        let result = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .unwrap()
+            .unwrap();
+        let TransferOutcome::Aborted(bytes) = result.unwrap() else {
+            panic!("expected Aborted");
+        };
+        assert_eq!(bytes, 512);
+    }
+
+    #[tokio::test]
+    async fn wrq_byte_count_on_client_error() {
+        let (dir, server_sock, client_sock) = setup_wrq().await;
+
+        let root = dir.path().to_path_buf();
+        let handle =
+            tokio::spawn(async move { handle_wrq(&root, &server_sock, "error_upload.txt").await });
+
+        let mut buf = [0u8; 600];
+
+        // receive ACK 0
+        let len = tokio::time::timeout(Duration::from_secs(2), client_sock.recv(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            Packet::decode(&buf[..len]).unwrap(),
+            Packet::Ack { block_num: 0 }
+        );
+
+        // send DATA block 1 (full 512 bytes)
+        let data1 = Packet::Data {
+            block_num: 1,
+            data: vec![0xBB; 512],
+        };
+        client_sock.send(&data1.encode()).await.unwrap();
+
+        // receive ACK 1
+        let len = tokio::time::timeout(Duration::from_secs(2), client_sock.recv(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            Packet::decode(&buf[..len]).unwrap(),
+            Packet::Ack { block_num: 1 }
+        );
+
+        // send ERROR instead of DATA block 2
+        let err_pkt = Packet::Error {
+            code: packet::ERR_NOT_DEFINED,
+            message: "client abort".into(),
+        };
+        client_sock.send(&err_pkt.encode()).await.unwrap();
+
+        // handler should return Aborted with byte count from block 1
+        let result = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .unwrap()
+            .unwrap();
+        let TransferOutcome::Aborted(bytes) = result.unwrap() else {
+            panic!("expected Aborted");
+        };
+        assert_eq!(bytes, 512);
+    }
+
+    // --- byte count tests ---
+
+    #[tokio::test]
+    async fn rrq_byte_count_exact_block_boundary() {
+        // 1024 bytes = exactly 2 full blocks, needs a 3rd empty block to signal end
+        let content = vec![0x42; 1024];
+        let (dir, server_sock, client_sock) = setup("exact.bin", &content).await;
+
+        let root = dir.path().to_path_buf();
+        let handle =
+            tokio::spawn(async move { handle_rrq(&root, &server_sock, "exact.bin").await });
+
+        for expected_block in 1..=3 {
+            let mut buf = [0u8; 600];
+            let len = tokio::time::timeout(Duration::from_secs(2), client_sock.recv(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+
+            let pkt = Packet::decode(&buf[..len]).unwrap();
+            match &pkt {
+                Packet::Data { block_num, .. } => assert_eq!(*block_num, expected_block),
+                other => panic!("expected Data block {expected_block}, got {other:?}"),
+            }
+
+            let ack = Packet::Ack {
+                block_num: expected_block,
+            };
+            client_sock.send(&ack.encode()).await.unwrap();
+        }
+
+        let result = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .unwrap()
+            .unwrap();
+        let TransferOutcome::Complete(bytes) = result.unwrap() else {
+            panic!("expected Complete");
+        };
+        assert_eq!(bytes, 1024);
+    }
+
+    #[tokio::test]
+    async fn wrq_byte_count_empty_termination_block() {
+        // exactly 512 bytes -> block 1 (512 bytes) + block 2 (0 bytes)
+        let (dir, server_sock, client_sock) = setup_wrq().await;
+        let content = vec![0xAA; 512];
+
+        let root = dir.path().to_path_buf();
+        let handle = tokio::spawn(async move { handle_wrq(&root, &server_sock, "term.bin").await });
+
+        let mut buf = [0u8; 600];
+
+        // receive ACK 0
+        let len = tokio::time::timeout(Duration::from_secs(2), client_sock.recv(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            Packet::decode(&buf[..len]).unwrap(),
+            Packet::Ack { block_num: 0 }
+        );
+
+        // send DATA block 1 (full 512 bytes)
+        let data1 = Packet::Data {
+            block_num: 1,
+            data: content.clone(),
+        };
+        client_sock.send(&data1.encode()).await.unwrap();
+
+        // receive ACK 1
+        let len = tokio::time::timeout(Duration::from_secs(2), client_sock.recv(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            Packet::decode(&buf[..len]).unwrap(),
+            Packet::Ack { block_num: 1 }
+        );
+
+        // send empty DATA block 2 (end of transfer)
+        let data2 = Packet::Data {
+            block_num: 2,
+            data: vec![],
+        };
+        client_sock.send(&data2.encode()).await.unwrap();
+
+        // receive ACK 2
+        let len = tokio::time::timeout(Duration::from_secs(2), client_sock.recv(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            Packet::decode(&buf[..len]).unwrap(),
+            Packet::Ack { block_num: 2 }
+        );
+
+        let result = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .unwrap()
+            .unwrap();
+        // byte count should be 512, not 512+0 - the empty termination block has 0 bytes
+        let TransferOutcome::Complete(bytes) = result.unwrap() else {
+            panic!("expected Complete");
+        };
+        assert_eq!(bytes, 512);
     }
 }
