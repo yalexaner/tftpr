@@ -9,6 +9,7 @@ A zero-config TFTP server (RFC 1350). Serves the current directory over TFTP wit
 - Path traversal protection
 - Per-transfer ephemeral sockets (proper TFTP transfer IDs)
 - Retransmission with configurable retries (3 attempts, 5s timeout)
+- Colored, timestamped server logs (auto-disabled when piped)
 - Async I/O via tokio
 
 ## Installation

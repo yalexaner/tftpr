@@ -6,6 +6,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::Semaphore;
 
 use crate::handler;
+use crate::log;
 use crate::packet::{self, Packet};
 
 const MAX_CONCURRENT_TRANSFERS: usize = 64;
@@ -42,7 +43,7 @@ impl Server {
             let (len, peer) = match self.socket.recv_from(&mut buf).await {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!("recv error: {e}");
+                    log::error_raw(&format!("recv error: {e}"));
                     continue;
                 }
             };
@@ -50,7 +51,7 @@ impl Server {
             let packet = match Packet::decode(&buf[..len]) {
                 Ok(p) => p,
                 Err(e) => {
-                    eprintln!("decode error from {peer}: {e}");
+                    log::error_raw(&format!("decode error from {peer}: {e}"));
                     let err_pkt = Packet::Error {
                         code: packet::ERR_ILLEGAL_OPERATION,
                         message: format!("malformed packet: {e}"),
@@ -66,7 +67,7 @@ impl Server {
                     let permit = match semaphore.try_acquire_owned() {
                         Ok(permit) => permit,
                         Err(_) => {
-                            eprintln!("too many concurrent transfers, rejecting {peer}");
+                            log::error("server busy");
                             let err_pkt = Packet::Error {
                                 code: packet::ERR_NOT_DEFINED,
                                 message: "server busy".into(),
@@ -80,7 +81,7 @@ impl Server {
                     tokio::spawn(async move {
                         let _permit = permit;
                         if let Err(e) = handle_request(root, peer, pkt).await {
-                            eprintln!("transfer error for {peer}: {e}");
+                            log::error_raw(&format!("transfer error for {peer}: {e}"));
                         }
                     });
                 }
@@ -100,6 +101,14 @@ async fn handle_request(root: PathBuf, peer: SocketAddr, packet: Packet) -> std:
     // bind ephemeral socket for this transfer
     let transfer_socket = UdpSocket::bind("0.0.0.0:0").await?;
     transfer_socket.connect(peer).await?;
+
+    let (op, filename) = match &packet {
+        Packet::Rrq { filename, .. } => ("GET", filename.clone()),
+        Packet::Wrq { filename, .. } => ("PUT", filename.clone()),
+        _ => return Ok(()),
+    };
+
+    log::request(op, &filename);
 
     let result = match packet {
         Packet::Rrq { filename, mode } => {
@@ -125,10 +134,21 @@ async fn handle_request(root: PathBuf, peer: SocketAddr, packet: Packet) -> std:
         _ => return Ok(()),
     };
 
-    if let Err(err_pkt) = result
-        && let Err(e) = transfer_socket.send(&err_pkt.encode()).await
-    {
-        eprintln!("failed to send error to {peer}: {e}");
+    match result {
+        Ok(handler::TransferOutcome::Complete(bytes)) => log::success(&filename, bytes),
+        Ok(handler::TransferOutcome::Aborted(bytes)) => {
+            log::error(&format!(
+                "{op} {filename} (aborted by client, {bytes} bytes transferred)"
+            ));
+        }
+        Err(err_pkt) => {
+            let msg = match &err_pkt {
+                Packet::Error { message, .. } => message.as_str(),
+                _ => "unknown error",
+            };
+            log::error(&format!("{op} {filename} ({msg})"));
+            let _ = transfer_socket.send(&err_pkt.encode()).await;
+        }
     }
 
     Ok(())
@@ -320,6 +340,101 @@ mod tests {
             panic!("expected Error packet, got {pkt:?}");
         };
         assert_eq!(code, packet::ERR_FILE_EXISTS);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn rejects_non_octet_mode_rrq() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("test.txt"), b"hello").unwrap();
+
+        let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
+        let server = Server::bind_addr(dir.path().to_path_buf(), addr)
+            .await
+            .unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let server = Arc::new(server);
+        let s = server.clone();
+        let handle = tokio::spawn(async move {
+            s.run().await;
+        });
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        // send an RRQ with netascii mode (not octet)
+        let rrq = Packet::Rrq {
+            filename: "test.txt".into(),
+            mode: "netascii".into(),
+        };
+        client.send_to(&rrq.encode(), server_addr).await.unwrap();
+
+        // should receive an ERROR from the ephemeral socket
+        let mut buf = [0u8; 600];
+        let (len, from) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .expect("timed out waiting for response")
+        .unwrap();
+
+        assert_ne!(from.port(), server_addr.port());
+
+        let pkt = Packet::decode(&buf[..len]).unwrap();
+        let Packet::Error { code, message } = pkt else {
+            panic!("expected Error packet, got {pkt:?}");
+        };
+        assert_eq!(code, packet::ERR_ILLEGAL_OPERATION);
+        assert!(message.contains("only octet mode"));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn rejects_non_octet_mode_wrq() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
+        let server = Server::bind_addr(dir.path().to_path_buf(), addr)
+            .await
+            .unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let server = Arc::new(server);
+        let s = server.clone();
+        let handle = tokio::spawn(async move {
+            s.run().await;
+        });
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        // send a WRQ with netascii mode (not octet)
+        let wrq = Packet::Wrq {
+            filename: "upload.txt".into(),
+            mode: "netascii".into(),
+        };
+        client.send_to(&wrq.encode(), server_addr).await.unwrap();
+
+        // should receive an ERROR from the ephemeral socket
+        let mut buf = [0u8; 600];
+        let (len, from) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .expect("timed out waiting for response")
+        .unwrap();
+
+        assert_ne!(from.port(), server_addr.port());
+
+        let pkt = Packet::decode(&buf[..len]).unwrap();
+        let Packet::Error { code, message } = pkt else {
+            panic!("expected Error packet, got {pkt:?}");
+        };
+        assert_eq!(code, packet::ERR_ILLEGAL_OPERATION);
+        assert!(message.contains("only octet mode"));
 
         handle.abort();
     }

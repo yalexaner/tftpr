@@ -392,9 +392,7 @@ pub async fn handle_wrq(
         let ack = Packet::Ack {
             block_num: expected_block,
         };
-        if let Err(e) = socket.send(&ack.encode()).await {
-            eprintln!("failed to send ACK for block {expected_block}: {e}");
-        }
+        let _ = socket.send(&ack.encode()).await;
 
         // last block: data < 512 bytes signals end of transfer
         if data.len() < MAX_DATA_LEN {
