@@ -1,10 +1,11 @@
 # tftpr
 
-A zero-config TFTP server (RFC 1350). Serves the current directory over TFTP with no required arguments.
+A zero-config TFTP server (RFC 1350) with block size option negotiation (RFC 2348). Serves the current directory over TFTP with no required arguments.
 
 ## Features
 
 - Read (RRQ) and write (WRQ) operations
+- Block size option negotiation (RFC 2348) for improved throughput
 - Octet transfer mode
 - Path traversal protection
 - Per-transfer ephemeral sockets (proper TFTP transfer IDs)
@@ -30,6 +31,7 @@ tftpr [OPTIONS] [DIRECTORY]
 ### Options
 
 - `-p, --port <PORT>` - port to listen on (default: 69)
+- `-b, --blksize <BLKSIZE>` - maximum block size for option negotiation, 512-65464 (default: 512)
 - `-V, --version` - print version
 - `-h, --help` - print help
 
