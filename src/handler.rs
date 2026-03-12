@@ -5,7 +5,7 @@ use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 
-use crate::packet::{self, MAX_DATA_LEN, Packet};
+use crate::packet::{self, Packet};
 
 /// resolves the real filesystem path of an open file descriptor.
 #[cfg(unix)]
@@ -75,18 +75,20 @@ fn verify_fd_within_root(file: &File, root: &Path) -> Result<(), Packet> {
 const MAX_RETRIES: u32 = 3;
 const RETRY_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub const DEFAULT_BLOCK_SIZE: usize = MAX_DATA_LEN;
+pub const DEFAULT_BLOCK_SIZE: usize = 512;
 pub const MAX_BLOCK_SIZE: usize = 65464;
 
-/// finds the blksize option (case-insensitive), parses it, and caps at
-/// server_max. returns None if blksize is absent, non-numeric, below 512,
-/// or if the negotiated value equals the default 512 (sending OACK for the
-/// standard block size adds overhead with no benefit).
-pub fn negotiate_blksize(options: &[(String, String)], server_max: usize) -> Option<usize> {
+// compile-time guarantee that MAX_BLOCK_SIZE fits in u16 (used for OACK encoding)
+const _: () = assert!(MAX_BLOCK_SIZE <= u16::MAX as usize);
+
+/// reads the blksize option from the typed Options struct and caps at
+/// server_max. returns None if blksize is absent, below 512, or if the
+/// negotiated value equals the default 512 (sending OACK for the standard
+/// block size adds overhead with no benefit).
+pub fn negotiate_blksize(options: &packet::Options, server_max: usize) -> Option<usize> {
     options
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("blksize"))
-        .and_then(|(_, v)| v.parse::<usize>().ok())
+        .blksize
+        .map(|v| v as usize)
         .filter(|&requested| requested >= DEFAULT_BLOCK_SIZE)
         .map(|requested| requested.min(server_max))
         .filter(|&negotiated| negotiated > DEFAULT_BLOCK_SIZE)
@@ -543,7 +545,9 @@ async fn wait_for_ack(socket: &UdpSocket, expected_block: u16) -> Result<(), boo
 /// returns Ok(Some(data)) on success, Ok(None) if client rejected (sent ERROR).
 async fn send_oack_wrq(socket: &UdpSocket, block_size: usize) -> Result<Option<Vec<u8>>, Packet> {
     let oack = Packet::Oack {
-        options: vec![("blksize".into(), block_size.to_string())],
+        options: packet::Options {
+            blksize: Some(block_size as u16),
+        },
     };
     let encoded = oack.encode();
 
@@ -599,7 +603,9 @@ async fn send_oack_wrq(socket: &UdpSocket, block_size: usize) -> Result<Option<V
 /// returns Ok(true) on success, Ok(false) if the client rejected (sent ERROR).
 async fn send_oack(socket: &UdpSocket, block_size: usize) -> Result<bool, Packet> {
     let oack = Packet::Oack {
-        options: vec![("blksize".into(), block_size.to_string())],
+        options: packet::Options {
+            blksize: Some(block_size as u16),
+        },
     };
     let encoded = oack.encode();
 
@@ -1101,7 +1107,9 @@ mod tests {
 
     #[test]
     fn negotiate_blksize_above_server_max() {
-        let options = vec![("blksize".into(), "8192".into())];
+        let options = packet::Options {
+            blksize: Some(8192),
+        };
         let result = negotiate_blksize(&options, 4096);
         assert_eq!(result, Some(4096));
     }
@@ -1110,7 +1118,9 @@ mod tests {
     fn negotiate_blksize_clamped_to_default_returns_none() {
         // when server_max=512, negotiation yields 512 which equals the default
         // block size — no point sending OACK for the standard size
-        let options = vec![("blksize".into(), "1024".into())];
+        let options = packet::Options {
+            blksize: Some(1024),
+        };
         let result = negotiate_blksize(&options, DEFAULT_BLOCK_SIZE);
         assert_eq!(result, None);
     }
@@ -1118,7 +1128,7 @@ mod tests {
     #[test]
     fn negotiate_blksize_exact_default_returns_none() {
         // client explicitly requests 512 — still no OACK needed
-        let options = vec![("blksize".into(), "512".into())];
+        let options = packet::Options { blksize: Some(512) };
         let result = negotiate_blksize(&options, 65464);
         assert_eq!(result, None);
     }
@@ -1127,37 +1137,41 @@ mod tests {
     fn negotiate_blksize_below_minimum() {
         // sub-512 requests are declined (None) rather than clamped up,
         // because RFC 2348 requires server response <= client request
-        let options = vec![("blksize".into(), "256".into())];
-        let result = negotiate_blksize(&options, 65464);
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn negotiate_blksize_invalid_non_numeric() {
-        let options = vec![("blksize".into(), "abc".into())];
+        let options = packet::Options { blksize: Some(256) };
         let result = negotiate_blksize(&options, 65464);
         assert_eq!(result, None);
     }
 
     #[test]
     fn negotiate_blksize_no_option() {
-        let options: Vec<(String, String)> = vec![];
+        let options = packet::Options::default();
         let result = negotiate_blksize(&options, 65464);
         assert_eq!(result, None);
     }
 
     #[test]
-    fn negotiate_blksize_case_insensitive() {
-        let options = vec![("BLKSIZE".into(), "1024".into())];
-        let result = negotiate_blksize(&options, 65464);
+    fn negotiate_blksize_within_range() {
+        let options = packet::Options {
+            blksize: Some(1024),
+        };
+        let result = negotiate_blksize(&options, 8192);
         assert_eq!(result, Some(1024));
     }
 
     #[test]
-    fn negotiate_blksize_within_range() {
-        let options = vec![("blksize".into(), "1024".into())];
-        let result = negotiate_blksize(&options, 8192);
-        assert_eq!(result, Some(1024));
+    fn negotiate_blksize_at_exact_server_max() {
+        let options = packet::Options {
+            blksize: Some(4096),
+        };
+        let result = negotiate_blksize(&options, 4096);
+        assert_eq!(result, Some(4096));
+    }
+
+    #[test]
+    fn negotiate_blksize_zero() {
+        let options = packet::Options { blksize: Some(0) };
+        let result = negotiate_blksize(&options, 65464);
+        assert_eq!(result, None);
     }
 
     // --- blksize integration tests ---
@@ -1181,7 +1195,12 @@ mod tests {
         let pkt = Packet::decode(&buf[..len]).unwrap();
         match &pkt {
             Packet::Oack { options } => {
-                assert_eq!(options, &vec![("blksize".into(), "1024".into())]);
+                assert_eq!(
+                    options,
+                    &packet::Options {
+                        blksize: Some(1024),
+                    }
+                );
             }
             other => panic!("expected OACK, got {other:?}"),
         }
@@ -1234,7 +1253,12 @@ mod tests {
         let pkt = Packet::decode(&buf[..len]).unwrap();
         match &pkt {
             Packet::Oack { options } => {
-                assert_eq!(options, &vec![("blksize".into(), "1024".into())]);
+                assert_eq!(
+                    options,
+                    &packet::Options {
+                        blksize: Some(1024),
+                    }
+                );
             }
             other => panic!("expected OACK, got {other:?}"),
         }
@@ -1401,7 +1425,12 @@ mod tests {
         let pkt = Packet::decode(&buf[..len]).unwrap();
         match &pkt {
             Packet::Oack { options } => {
-                assert_eq!(options, &vec![("blksize".into(), "1024".into())]);
+                assert_eq!(
+                    options,
+                    &packet::Options {
+                        blksize: Some(1024),
+                    }
+                );
             }
             other => panic!("expected OACK, got {other:?}"),
         }

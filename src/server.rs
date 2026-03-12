@@ -117,7 +117,7 @@ async fn handle_request(
         Packet::Rrq {
             filename,
             mode,
-            options,
+            ref options,
         } => {
             if !mode.eq_ignore_ascii_case("octet") {
                 Err(Packet::Error {
@@ -125,14 +125,14 @@ async fn handle_request(
                     message: "only octet mode is supported".into(),
                 })
             } else {
-                let negotiated_blksize = handler::negotiate_blksize(&options, max_block_size);
+                let negotiated_blksize = handler::negotiate_blksize(options, max_block_size);
                 handler::handle_rrq(&root, &transfer_socket, &filename, negotiated_blksize).await
             }
         }
         Packet::Wrq {
             filename,
             mode,
-            options,
+            ref options,
         } => {
             if !mode.eq_ignore_ascii_case("octet") {
                 Err(Packet::Error {
@@ -140,7 +140,7 @@ async fn handle_request(
                     message: "only octet mode is supported".into(),
                 })
             } else {
-                let negotiated_blksize = handler::negotiate_blksize(&options, max_block_size);
+                let negotiated_blksize = handler::negotiate_blksize(options, max_block_size);
                 handler::handle_wrq(&root, &transfer_socket, &filename, negotiated_blksize).await
             }
         }
@@ -283,7 +283,7 @@ mod tests {
         let wrq = Packet::Wrq {
             filename: "upload.txt".into(),
             mode: "octet".into(),
-            options: vec![],
+            options: packet::Options::default(),
         };
         client.send_to(&wrq.encode(), server_addr).await.unwrap();
 
@@ -327,7 +327,7 @@ mod tests {
         let wrq = Packet::Wrq {
             filename: "exists.txt".into(),
             mode: "octet".into(),
-            options: vec![],
+            options: packet::Options::default(),
         };
         client.send_to(&wrq.encode(), server_addr).await.unwrap();
 
@@ -376,7 +376,7 @@ mod tests {
         let rrq = Packet::Rrq {
             filename: "test.txt".into(),
             mode: "octet".into(),
-            options: vec![],
+            options: packet::Options::default(),
         };
         client.send_to(&rrq.encode(), server_addr).await.unwrap();
 
@@ -428,7 +428,9 @@ mod tests {
         let rrq = Packet::Rrq {
             filename: "blk.txt".into(),
             mode: "octet".into(),
-            options: vec![("blksize".into(), "1024".into())],
+            options: packet::Options {
+                blksize: Some(1024),
+            },
         };
         client.send_to(&rrq.encode(), server_addr).await.unwrap();
 
@@ -446,7 +448,12 @@ mod tests {
         let pkt = Packet::decode(&buf[..len]).unwrap();
         match &pkt {
             Packet::Oack { options } => {
-                assert_eq!(options, &vec![("blksize".into(), "1024".into())]);
+                assert_eq!(
+                    options,
+                    &packet::Options {
+                        blksize: Some(1024),
+                    }
+                );
             }
             other => panic!("expected OACK, got {other:?}"),
         }
