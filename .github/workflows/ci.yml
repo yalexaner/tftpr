@@ -42,7 +42,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - uses: taiki-e/install-action@3cb103a10a5f98c33952090281d3d89289c94db0 # cargo-deny
         with:
-          tool: cargo-deny
+          tool: cargo-deny@0.19
       - run: cargo deny --locked check
 
   # --- future jobs ---
