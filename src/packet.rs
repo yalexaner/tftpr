@@ -79,7 +79,10 @@ impl Packet {
                 let code = u16::from_be_bytes([rest[0], rest[1]]);
                 let msg_bytes = &rest[2..];
                 // error message is null-terminated, but we tolerate missing terminator
-                let msg_end = msg_bytes.iter().position(|&b| b == 0).unwrap_or(msg_bytes.len());
+                let msg_end = msg_bytes
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(msg_bytes.len());
                 let message = std::str::from_utf8(&msg_bytes[..msg_end])
                     .map_err(|_| PacketError::InvalidUtf8)?
                     .to_string();
@@ -262,10 +265,7 @@ mod tests {
 
     #[test]
     fn too_short_empty() {
-        assert!(matches!(
-            Packet::decode(&[]),
-            Err(PacketError::TooShort)
-        ));
+        assert!(matches!(Packet::decode(&[]), Err(PacketError::TooShort)));
     }
 
     #[test]
@@ -309,29 +309,20 @@ mod tests {
     fn data_missing_block_num() {
         // opcode 3 with only 1 byte after
         let buf = [0x00, 0x03, 0x00];
-        assert!(matches!(
-            Packet::decode(&buf),
-            Err(PacketError::TooShort)
-        ));
+        assert!(matches!(Packet::decode(&buf), Err(PacketError::TooShort)));
     }
 
     #[test]
     fn ack_missing_block_num() {
         // opcode 4 with no block num
         let buf = [0x00, 0x04];
-        assert!(matches!(
-            Packet::decode(&buf),
-            Err(PacketError::TooShort)
-        ));
+        assert!(matches!(Packet::decode(&buf), Err(PacketError::TooShort)));
     }
 
     #[test]
     fn error_missing_code() {
         let buf = [0x00, 0x05, 0x00];
-        assert!(matches!(
-            Packet::decode(&buf),
-            Err(PacketError::TooShort)
-        ));
+        assert!(matches!(Packet::decode(&buf), Err(PacketError::TooShort)));
     }
 
     // encoding format tests

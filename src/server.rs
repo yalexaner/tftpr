@@ -96,11 +96,7 @@ impl Server {
     }
 }
 
-async fn handle_request(
-    root: PathBuf,
-    peer: SocketAddr,
-    packet: Packet,
-) -> std::io::Result<()> {
+async fn handle_request(root: PathBuf, peer: SocketAddr, packet: Packet) -> std::io::Result<()> {
     // bind ephemeral socket for this transfer
     let transfer_socket = UdpSocket::bind("0.0.0.0:0").await?;
     transfer_socket.connect(peer).await?;

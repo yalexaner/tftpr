@@ -70,5 +70,4 @@ mod tests {
         let cli = Cli::parse_from(["tftpr", "--port", "8080"]);
         assert_eq!(cli.port, 8080);
     }
-
 }

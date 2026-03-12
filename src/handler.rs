@@ -5,7 +5,7 @@ use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 
-use crate::packet::{self, Packet, MAX_DATA_LEN};
+use crate::packet::{self, MAX_DATA_LEN, Packet};
 
 /// resolves the real filesystem path of an open file descriptor.
 #[cfg(unix)]
@@ -58,7 +58,7 @@ fn verify_fd_within_root(file: &File, root: &Path) -> Result<(), Packet> {
             return Err(Packet::Error {
                 code: packet::ERR_NOT_DEFINED,
                 message: "server error".into(),
-            })
+            });
         }
     };
 
@@ -150,7 +150,10 @@ fn resolve_path_for_write(root: &Path, filename: &str) -> Result<PathBuf, Packet
     let full_path = canonical_root.join(requested);
 
     // reject symlinks at the target path to prevent writing outside root
-    if full_path.symlink_metadata().is_ok_and(|m| m.file_type().is_symlink()) {
+    if full_path
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink())
+    {
         return Err(Packet::Error {
             code: packet::ERR_ACCESS_VIOLATION,
             message: "access violation".into(),
@@ -182,13 +185,8 @@ fn resolve_path_for_write(root: &Path, filename: &str) -> Result<PathBuf, Packet
     Ok(full_path)
 }
 
-
 /// handles a read request: sends the file to the peer in 512-byte DATA blocks.
-pub async fn handle_rrq(
-    root: &Path,
-    socket: &UdpSocket,
-    filename: &str,
-) -> Result<(), Packet> {
+pub async fn handle_rrq(root: &Path, socket: &UdpSocket, filename: &str) -> Result<(), Packet> {
     let path = resolve_path(root, filename)?;
 
     let mut file = File::open(&path).await.map_err(|e| {
@@ -215,10 +213,13 @@ pub async fn handle_rrq(
     loop {
         let mut bytes_read = 0;
         while bytes_read < MAX_DATA_LEN {
-            let n = file.read(&mut buf[bytes_read..]).await.map_err(|_| Packet::Error {
-                code: packet::ERR_NOT_DEFINED,
-                message: "read error".into(),
-            })?;
+            let n = file
+                .read(&mut buf[bytes_read..])
+                .await
+                .map_err(|_| Packet::Error {
+                    code: packet::ERR_NOT_DEFINED,
+                    message: "read error".into(),
+                })?;
             if n == 0 {
                 break;
             }
@@ -293,11 +294,7 @@ pub async fn handle_rrq(
 }
 
 /// handles a write request: receives the file from the peer in 512-byte DATA blocks.
-pub async fn handle_wrq(
-    root: &Path,
-    socket: &UdpSocket,
-    filename: &str,
-) -> Result<(), Packet> {
+pub async fn handle_wrq(root: &Path, socket: &UdpSocket, filename: &str) -> Result<(), Packet> {
     let path = resolve_path_for_write(root, filename)?;
 
     // create file atomically before accepting the transfer
@@ -335,10 +332,13 @@ pub async fn handle_wrq(
 
     // send ACK 0 to accept the transfer
     let ack0 = Packet::Ack { block_num: 0 };
-    socket.send(&ack0.encode()).await.map_err(|_| Packet::Error {
-        code: packet::ERR_NOT_DEFINED,
-        message: "failed to send initial ACK".into(),
-    })?;
+    socket
+        .send(&ack0.encode())
+        .await
+        .map_err(|_| Packet::Error {
+            code: packet::ERR_NOT_DEFINED,
+            message: "failed to send initial ACK".into(),
+        })?;
 
     let mut expected_block: u16 = 1;
 
@@ -534,9 +534,8 @@ mod tests {
         let (dir, server_sock, client_sock) = setup("small.txt", content).await;
 
         let root = dir.path().to_path_buf();
-        let handle = tokio::spawn(async move {
-            handle_rrq(&root, &server_sock, "small.txt").await
-        });
+        let handle =
+            tokio::spawn(async move { handle_rrq(&root, &server_sock, "small.txt").await });
 
         // receive DATA block 1
         let mut buf = [0u8; 600];
@@ -573,9 +572,8 @@ mod tests {
         let (dir, server_sock, client_sock) = setup("multi.bin", &content).await;
 
         let root = dir.path().to_path_buf();
-        let handle = tokio::spawn(async move {
-            handle_rrq(&root, &server_sock, "multi.bin").await
-        });
+        let handle =
+            tokio::spawn(async move { handle_rrq(&root, &server_sock, "multi.bin").await });
 
         let mut received = Vec::new();
 
@@ -704,9 +702,8 @@ mod tests {
         let content = b"hello upload!";
 
         let root = dir.path().to_path_buf();
-        let handle = tokio::spawn(async move {
-            handle_wrq(&root, &server_sock, "uploaded.txt").await
-        });
+        let handle =
+            tokio::spawn(async move { handle_wrq(&root, &server_sock, "uploaded.txt").await });
 
         // receive ACK 0
         let mut buf = [0u8; 600];
@@ -752,9 +749,8 @@ mod tests {
 
         let root = dir.path().to_path_buf();
         let content_clone = content.clone();
-        let handle = tokio::spawn(async move {
-            handle_wrq(&root, &server_sock, "multi.bin").await
-        });
+        let handle =
+            tokio::spawn(async move { handle_wrq(&root, &server_sock, "multi.bin").await });
 
         let mut buf = [0u8; 600];
 
@@ -763,7 +759,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(Packet::decode(&buf[..len]).unwrap(), Packet::Ack { block_num: 0 });
+        assert_eq!(
+            Packet::decode(&buf[..len]).unwrap(),
+            Packet::Ack { block_num: 0 }
+        );
 
         // send DATA block 1 (full 512 bytes)
         let data1 = Packet::Data {
@@ -777,7 +776,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(Packet::decode(&buf[..len]).unwrap(), Packet::Ack { block_num: 1 });
+        assert_eq!(
+            Packet::decode(&buf[..len]).unwrap(),
+            Packet::Ack { block_num: 1 }
+        );
 
         // send DATA block 2 (empty = end of transfer)
         let data2 = Packet::Data {
@@ -791,7 +793,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(Packet::decode(&buf[..len]).unwrap(), Packet::Ack { block_num: 2 });
+        assert_eq!(
+            Packet::decode(&buf[..len]).unwrap(),
+            Packet::Ack { block_num: 2 }
+        );
 
         let result = tokio::time::timeout(Duration::from_secs(2), handle)
             .await
