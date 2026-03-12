@@ -482,4 +482,110 @@ mod tests {
 
         handle.abort();
     }
+
+    #[tokio::test]
+    async fn rrq_with_unknown_options_only_no_oack() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("tsize.txt"), b"no oack expected").unwrap();
+
+        let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
+        let server = Server::bind_addr(dir.path().to_path_buf(), addr, 1024)
+            .await
+            .unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let server = Arc::new(server);
+        let s = server.clone();
+        let handle = tokio::spawn(async move {
+            s.run().await;
+        });
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        // craft raw RRQ with only unknown option (tsize) — no blksize
+        let mut raw = vec![0x00, 0x01]; // RRQ opcode
+        raw.extend_from_slice(b"tsize.txt");
+        raw.push(0);
+        raw.extend_from_slice(b"octet");
+        raw.push(0);
+        raw.extend_from_slice(b"tsize");
+        raw.push(0);
+        raw.extend_from_slice(b"0");
+        raw.push(0);
+        client.send_to(&raw, server_addr).await.unwrap();
+
+        // should receive DATA(1) directly, NOT an OACK
+        let mut buf = [0u8; 600];
+        let (len, from) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .expect("timed out waiting for response")
+        .unwrap();
+
+        assert_ne!(from.port(), server_addr.port());
+
+        let pkt = Packet::decode(&buf[..len]).unwrap();
+        match pkt {
+            Packet::Data { block_num, data } => {
+                assert_eq!(block_num, 1);
+                assert_eq!(data, b"no oack expected");
+            }
+            other => panic!("expected Data (no OACK), got {other:?}"),
+        }
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn rrq_with_blksize_512_no_oack() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("default.txt"), b"default block size").unwrap();
+
+        let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
+        let server = Server::bind_addr(dir.path().to_path_buf(), addr, 1024)
+            .await
+            .unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let server = Arc::new(server);
+        let s = server.clone();
+        let handle = tokio::spawn(async move {
+            s.run().await;
+        });
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        // send RRQ with blksize=512 (equals default — negotiate returns None)
+        let rrq = Packet::Rrq {
+            filename: "default.txt".into(),
+            mode: "octet".into(),
+            options: packet::Options { blksize: Some(512) },
+        };
+        client.send_to(&rrq.encode(), server_addr).await.unwrap();
+
+        // should receive DATA(1) directly, NOT an OACK
+        let mut buf = [0u8; 600];
+        let (len, from) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .expect("timed out waiting for response")
+        .unwrap();
+
+        assert_ne!(from.port(), server_addr.port());
+
+        let pkt = Packet::decode(&buf[..len]).unwrap();
+        match pkt {
+            Packet::Data { block_num, data } => {
+                assert_eq!(block_num, 1);
+                assert_eq!(data, b"default block size");
+            }
+            other => panic!("expected Data (no OACK for blksize=512), got {other:?}"),
+        }
+
+        handle.abort();
+    }
 }

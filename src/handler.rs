@@ -235,9 +235,43 @@ pub async fn handle_rrq(
 
     let block_size = negotiated_blksize.unwrap_or(DEFAULT_BLOCK_SIZE);
 
-    // send OACK if blksize was negotiated
-    if negotiated_blksize.is_some() && !send_oack(socket, block_size).await? {
-        return Ok(());
+    // send OACK if blksize was negotiated, then wait for ACK(0)
+    if negotiated_blksize.is_some() {
+        let oack = Packet::Oack {
+            options: packet::Options {
+                blksize: Some(block_size as u16),
+            },
+        };
+        let encoded = oack.encode();
+
+        let mut timeouts = 0u32;
+        loop {
+            if socket.send(&encoded).await.is_err() {
+                timeouts += 1;
+                if timeouts >= MAX_RETRIES {
+                    return Err(Packet::Error {
+                        code: packet::ERR_NOT_DEFINED,
+                        message: "transfer timed out".into(),
+                    });
+                }
+                continue;
+            }
+
+            match wait_for_ack(socket, 0).await {
+                Ok(()) => break,
+                Err(true) => return Ok(()),
+                Err(false) => {
+                    timeouts += 1;
+                    if timeouts >= MAX_RETRIES {
+                        return Err(Packet::Error {
+                            code: packet::ERR_NOT_DEFINED,
+                            message: "transfer timed out".into(),
+                        });
+                    }
+                    continue;
+                }
+            }
+        }
     }
 
     let mut block_num: u16 = 1;
@@ -376,14 +410,34 @@ pub async fn handle_wrq(
     let mut first_data: Option<Vec<u8>> = None;
 
     if negotiated_blksize.is_some() {
-        match send_oack_wrq(socket, block_size).await? {
-            Some(data) => first_data = Some(data),
-            None => {
+        let oack = Packet::Oack {
+            options: packet::Options {
+                blksize: Some(block_size as u16),
+            },
+        };
+        let oack_bytes = oack.encode();
+
+        socket.send(&oack_bytes).await.map_err(|_| Packet::Error {
+            code: packet::ERR_NOT_DEFINED,
+            message: "failed to send OACK".into(),
+        })?;
+
+        // wait for DATA(1) with OACK retransmission on timeout
+        match wait_for_data(socket, 1, block_size, Some(&oack_bytes)).await {
+            Ok(data) => first_data = Some(data),
+            Err(true) => {
                 // client rejected OACK — intentionally do NOT remove by
                 // pathname (same TOCTOU concern as the verify_fd failure
                 // path above). a leaked empty file is the lesser evil.
                 drop(file);
                 return Ok(());
+            }
+            Err(false) => {
+                drop(file);
+                return Err(Packet::Error {
+                    code: packet::ERR_NOT_DEFINED,
+                    message: "transfer timed out".into(),
+                });
             }
         }
     } else {
@@ -405,7 +459,7 @@ pub async fn handle_wrq(
         let data = if let Some(d) = first_data.take() {
             d
         } else {
-            match wait_for_data(socket, expected_block, block_size).await {
+            match wait_for_data(socket, expected_block, block_size, None).await {
                 Ok(d) => d,
                 Err(client_error) => {
                     if client_error {
@@ -464,6 +518,7 @@ async fn wait_for_data(
     socket: &UdpSocket,
     expected_block: u16,
     block_size: usize,
+    on_timeout_send: Option<&[u8]>,
 ) -> Result<Vec<u8>, bool> {
     let deadline = tokio::time::Instant::now() + RETRY_TIMEOUT * MAX_RETRIES;
     let mut next_resend = tokio::time::Instant::now() + RETRY_TIMEOUT;
@@ -502,11 +557,15 @@ async fn wait_for_data(
                 }
             },
             _ => {
-                // timeout or recv error - resend previous ACK to trigger retransmit
-                let prev_ack = Packet::Ack {
-                    block_num: expected_block.wrapping_sub(1),
-                };
-                let _ = socket.send(&prev_ack.encode()).await;
+                // timeout or recv error - retransmit to trigger client resend
+                if let Some(bytes) = on_timeout_send {
+                    let _ = socket.send(bytes).await;
+                } else {
+                    let prev_ack = Packet::Ack {
+                        block_num: expected_block.wrapping_sub(1),
+                    };
+                    let _ = socket.send(&prev_ack.encode()).await;
+                }
                 next_resend = tokio::time::Instant::now() + RETRY_TIMEOUT;
             }
         }
@@ -535,106 +594,6 @@ async fn wait_for_ack(socket: &UdpSocket, expected_block: u16) -> Result<(), boo
             Ok(Packet::Ack { block_num }) if block_num == expected_block => return Ok(()),
             Ok(Packet::Error { .. }) => return Err(true),
             _ => continue, // stale/wrong-block ACK, keep waiting
-        }
-    }
-}
-
-/// sends an OACK for a WRQ and waits for DATA(1) — the RFC 2347
-/// acknowledgment for OACK in write transfers. retries up to MAX_RETRIES
-/// times on timeout.
-/// returns Ok(Some(data)) on success, Ok(None) if client rejected (sent ERROR).
-async fn send_oack_wrq(socket: &UdpSocket, block_size: usize) -> Result<Option<Vec<u8>>, Packet> {
-    let oack = Packet::Oack {
-        options: packet::Options {
-            blksize: Some(block_size as u16),
-        },
-    };
-    let encoded = oack.encode();
-
-    let mut timeouts = 0u32;
-    loop {
-        if socket.send(&encoded).await.is_err() {
-            timeouts += 1;
-            if timeouts >= MAX_RETRIES {
-                return Err(Packet::Error {
-                    code: packet::ERR_NOT_DEFINED,
-                    message: "transfer timed out".into(),
-                });
-            }
-            continue;
-        }
-
-        let deadline = tokio::time::Instant::now() + RETRY_TIMEOUT;
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-
-            // allocate 1 extra byte to detect oversized datagrams — UDP recv()
-            // silently truncates, so without this we'd write corrupt data
-            let mut recv_buf = vec![0u8; 4 + block_size + 1];
-            match tokio::time::timeout(remaining, socket.recv(&mut recv_buf)).await {
-                Ok(Ok(len)) if len > 4 + block_size => continue, // oversized packet, skip
-                Ok(Ok(len)) => match Packet::decode(&recv_buf[..len]) {
-                    Ok(Packet::Data { block_num: 1, data }) => {
-                        return Ok(Some(data));
-                    }
-                    Ok(Packet::Error { .. }) => return Ok(None),
-                    _ => continue,
-                },
-                _ => break,
-            }
-        }
-
-        timeouts += 1;
-        if timeouts >= MAX_RETRIES {
-            return Err(Packet::Error {
-                code: packet::ERR_NOT_DEFINED,
-                message: "transfer timed out".into(),
-            });
-        }
-    }
-}
-
-/// sends an OACK with the negotiated block size and waits for ACK(0)
-/// confirmation. used for RRQ transfers. retries up to MAX_RETRIES
-/// times on timeout.
-/// returns Ok(true) on success, Ok(false) if the client rejected (sent ERROR).
-async fn send_oack(socket: &UdpSocket, block_size: usize) -> Result<bool, Packet> {
-    let oack = Packet::Oack {
-        options: packet::Options {
-            blksize: Some(block_size as u16),
-        },
-    };
-    let encoded = oack.encode();
-
-    let mut timeouts = 0u32;
-    loop {
-        if socket.send(&encoded).await.is_err() {
-            timeouts += 1;
-            if timeouts >= MAX_RETRIES {
-                return Err(Packet::Error {
-                    code: packet::ERR_NOT_DEFINED,
-                    message: "transfer timed out".into(),
-                });
-            }
-            continue;
-        }
-
-        match wait_for_ack(socket, 0).await {
-            Ok(()) => return Ok(true),
-            Err(true) => return Ok(false),
-            Err(false) => {
-                timeouts += 1;
-                if timeouts >= MAX_RETRIES {
-                    return Err(Packet::Error {
-                        code: packet::ERR_NOT_DEFINED,
-                        message: "transfer timed out".into(),
-                    });
-                }
-                continue;
-            }
         }
     }
 }
@@ -1478,5 +1437,39 @@ mod tests {
 
         let written = std::fs::read(dir.path().join("blk_multi_upload.bin")).unwrap();
         assert_eq!(written, content);
+    }
+
+    #[tokio::test]
+    async fn rrq_oack_client_error() {
+        let content = b"oack error test";
+        let (dir, server_sock, client_sock) = setup("oack_err.txt", content).await;
+        let root = dir.path().to_path_buf();
+
+        let handle = tokio::spawn(async move {
+            handle_rrq(&root, &server_sock, "oack_err.txt", Some(1024)).await
+        });
+
+        // receive OACK
+        let mut buf = [0u8; 600];
+        let len = tokio::time::timeout(Duration::from_secs(2), client_sock.recv(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let pkt = Packet::decode(&buf[..len]).unwrap();
+        assert!(matches!(pkt, Packet::Oack { .. }));
+
+        // client rejects OACK by sending ERROR
+        let err_pkt = Packet::Error {
+            code: packet::ERR_ILLEGAL_OPERATION,
+            message: "option not supported".into(),
+        };
+        client_sock.send(&err_pkt.encode()).await.unwrap();
+
+        // handler should complete without error (graceful abort)
+        let result = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_ok());
     }
 }
