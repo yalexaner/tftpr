@@ -1,4 +1,5 @@
 mod handler;
+mod log;
 mod packet;
 mod server;
 
