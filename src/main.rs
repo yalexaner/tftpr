@@ -1,4 +1,5 @@
 mod handler;
+mod log;
 mod packet;
 mod server;
 
@@ -35,7 +36,7 @@ async fn main() {
         std::process::exit(1);
     }
 
-    println!("serving {} on port {}", dir.display(), cli.port);
+    log::info(&format!("serving {} on port {}", dir.display(), cli.port));
 
     let server = server::Server::bind(dir, cli.port)
         .await
